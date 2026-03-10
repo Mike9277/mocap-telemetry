@@ -1,0 +1,6 @@
+fastapi==0.89.1
+uvicorn==0.20.0
+pydantic==1.10.5
+websockets==11.0
+sqlalchemy==2.0.24
+python-multipart==0.0.5
