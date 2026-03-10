@@ -58,10 +58,15 @@ async def handle_sensor_connection(ws, path):
                 last_frames[sensor_id] = frame
                 
                 # Broadcast ai dashboard
-                broadcast_msg = json.dumps({
-                    "type": "mocap_frame",
-                    "data": frame
-                })
+                # Se contiene keypoints, è un sensore di pose detection - invia direttamente
+                if frame.get("keypoints"):
+                    broadcast_msg = json.dumps(frame, default=str)
+                else:
+                    # Altrimenti è mocap tradizionale - wrappa in formato "mocap_frame"
+                    broadcast_msg = json.dumps({
+                        "type": "mocap_frame",
+                        "data": frame
+                    }, default=str)
                 
                 # Invia a tutti i dashboard
                 for dashboard in list(connected_dashboards):

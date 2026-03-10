@@ -4,6 +4,7 @@ export function useMocapWebSocket(url = 'ws://localhost:8002') {
   const [frames, setFrames] = useState([])
   const [isConnected, setIsConnected] = useState(false)
   const [error, setError] = useState(null)
+  const [poseData, setPoseData] = useState(null)
   const wsRef = useRef(null)
 
   useEffect(() => {
@@ -20,10 +21,25 @@ export function useMocapWebSocket(url = 'ws://localhost:8002') {
       try {
         const message = JSON.parse(event.data)
         
+        // Supporta sia il formato mocap_frame che il nuovo formato pose detection
         if (message.type === 'mocap_frame') {
           setFrames(prev => {
             const updated = [...prev, message.data]
-            // Mantieni gli ultimi 100 frame in memoria
+            return updated.slice(-100)
+          })
+        } else if (message.keypoints || message.has_person !== undefined) {
+          // Nuovo formato YOLOv8 Pose Detection
+          setPoseData(message)
+          
+          // Debug: mostra se il video è presente
+          if (message.video) {
+            console.log(`✓ Video ricevuto (${message.video.length} bytes), frame: ${message.frame_count}`)
+          } else {
+            console.warn(`⚠️ Video NON presente nel frame ${message.frame_count}`)
+          }
+          
+          setFrames(prev => {
+            const updated = [...prev, message]
             return updated.slice(-100)
           })
         }
@@ -69,6 +85,7 @@ export function useMocapWebSocket(url = 'ws://localhost:8002') {
     frames,
     isConnected,
     error,
+    poseData,
     getLatestFrame,
     getJointHistory
   }
