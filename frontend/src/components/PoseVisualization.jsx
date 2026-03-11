@@ -1,12 +1,23 @@
+/*
+######################
+#  PoseVisualization.jsx
+#
+# Component for displaying live video feed from pose detection
+# Shows real-time skeleton overlay and person detection status
+#
+# Author: Michelangelo Guaitolini, 11.03.2026
+######################
+*/
+
 import React, { useState, useEffect } from 'react'
 
 export function PoseVisualization({ poseData, width = 640, height = 480 }) {
   const [videoSrc, setVideoSrc] = useState(null)
 
-  // Quando riceviamo un nuovo frame con video, lo mostriamo
+  // When we receive a new frame with video, display it
   useEffect(() => {
     if (poseData && poseData.video) {
-      // Crea un data URL dall'immagine base64
+      // Create data URL from base64 image
       const dataUrl = `data:image/jpeg;base64,${poseData.video}`
       setVideoSrc(dataUrl)
       console.log(`✓ PoseVisualization: video set (${poseData.video.length} bytes)`)

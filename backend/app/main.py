@@ -1,6 +1,15 @@
-"""
-FastAPI Backend per Real-Time Mocap Telemetry
-Gestisce WebSocket per ingestion dati e REST API
+####################
+#  main.py
+#
+# FastAPI Backend for Real-Time Mocap Telemetry
+# Handles WebSocket for data ingestion and REST API
+#
+# Author: Michelangelo Guaitolini, 11.03.2026
+####################
+
+__doc__ = """
+FastAPI Backend for Real-Time Mocap Telemetry
+Handles WebSocket for data ingestion and REST API
 """
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -45,14 +54,14 @@ sensor_status: Dict[str, SensorStatus] = {}
 
 @app.on_event("startup")
 async def startup():
-    """Inizializzazione al startup"""
-    logger.info("🚀 Backend Mocap Telemetry avviato")
+    """Initialization at startup"""
+    logger.info("🚀 Mocap Telemetry Backend started")
 
 
 @app.on_event("shutdown")
 async def shutdown():
-    """Cleanup al shutdown"""
-    logger.info("🛑 Backend Mocap Telemetry fermato")
+    """Cleanup at shutdown"""
+    logger.info("🛑 Mocap Telemetry Backend stopped")
 
 
 @app.get("/health")
@@ -68,7 +77,7 @@ async def health():
 
 @app.get("/api/sensors")
 async def get_sensors():
-    """Restituisce lo stato di tutti i sensori"""
+    """Return status of all sensors"""
     return {
         "sensors": sensor_status,
         "count": len(sensor_status)
@@ -77,7 +86,7 @@ async def get_sensors():
 
 @app.get("/api/history")
 async def get_history(joint: str = "head", limit: int = 100):
-    """Restituisce lo storico di un joint"""
+    """Return history of a joint"""
     history = data_store.get_joint_history(joint, limit)
     return {
         "joint": joint,
@@ -88,22 +97,22 @@ async def get_history(joint: str = "head", limit: int = 100):
 
 @app.websocket("/ws/sensor")
 async def websocket_sensor_endpoint(websocket: WebSocket):
-    """WebSocket per ricevere dati dai sensori"""
+    """WebSocket to receive data from sensors"""
     await websocket.accept()
     connected_clients.add(websocket)
     
-    logger.info(f"✓ Sensore connesso | Client totali: {len(connected_clients)}")
+    logger.info(f"✓ Sensor connected | Total clients: {len(connected_clients)}")
     
     try:
         while True:
-            # Ricevi frame dal sensore
+            # Receive frame from sensor
             data = await websocket.receive_text()
             frame_dict = json.loads(data)
             
-            # Parse al modello
+            # Parse to model
             frame = MocapFrame(**frame_dict)
             
-            # Aggiorna status sensore
+            # Update sensor status
             if frame.sensor_id not in sensor_status:
                 sensor_status[frame.sensor_id] = SensorStatus(sensor_id=frame.sensor_id)
             
@@ -111,16 +120,16 @@ async def websocket_sensor_endpoint(websocket: WebSocket):
             sensor_status[frame.sensor_id].frame_count += 1
             sensor_status[frame.sensor_id].is_online = True
             
-            # Processa il frame (smoothing, velocità, etc.)
+            # Process the frame (smoothing, velocity, etc.)
             processed_frame = processor.process(frame)
             
-            # Salva nel database
+            # Save to database
             await data_store.save_frame(processed_frame)
             
-            # Broadcast a tutti i client connessi (frontend)
+            # Broadcast to all connected clients (frontend)
             await broadcast_to_clients(processed_frame)
             
-            # Log (ogni 30 frame = 1 secondo a 30 Hz)
+            # Log (every 30 frames = 1 second at 30 Hz)
             if sensor_status[frame.sensor_id].frame_count % 30 == 0:
                 logger.info(
                     f"📊 {frame.sensor_id} | Frame: {sensor_status[frame.sensor_id].frame_count} | "
@@ -129,38 +138,38 @@ async def websocket_sensor_endpoint(websocket: WebSocket):
     
     except WebSocketDisconnect:
         connected_clients.discard(websocket)
-        logger.warning(f"✗ Sensore disconnesso | Client totali: {len(connected_clients)}")
+        logger.warning(f"✗ Sensor disconnected | Total clients: {len(connected_clients)}")
         if frame and frame.sensor_id in sensor_status:
             sensor_status[frame.sensor_id].is_online = False
     
     except json.JSONDecodeError as e:
-        logger.error(f"✗ Errore parsing JSON: {e}")
+        logger.error(f"✗ Error parsing JSON: {e}")
         await websocket.close(code=1003, reason="Invalid JSON")
     
     except Exception as e:
-        logger.error(f"✗ Errore WebSocket: {e}")
+        logger.error(f"✗ WebSocket error: {e}")
 
 
 @app.websocket("/ws/dashboard")
 async def websocket_dashboard_endpoint(websocket: WebSocket):
-    """WebSocket per inviare dati reali-time al frontend"""
+    """WebSocket to send real-time data to frontend"""
     await websocket.accept()
     connected_clients.add(websocket)
     
-    logger.info(f"📱 Dashboard connesso | Client totali: {len(connected_clients)}")
+    logger.info(f"📱 Dashboard connected | Total clients: {len(connected_clients)}")
     
     try:
         while True:
-            # Mantieni la connessione aperta
+            # Keep connection open
             await asyncio.sleep(1)
     
     except WebSocketDisconnect:
         connected_clients.discard(websocket)
-        logger.info(f"📱 Dashboard disconnesso | Client totali: {len(connected_clients)}")
+        logger.info(f"📱 Dashboard disconnected | Total clients: {len(connected_clients)}")
 
 
 async def broadcast_to_clients(frame: Dict):
-    """Invia il frame a tutti i client connessi (frontend)"""
+    """Send the frame to all connected clients (frontend)"""
     if not connected_clients:
         return
     
@@ -169,18 +178,18 @@ async def broadcast_to_clients(frame: Dict):
         "data": frame.dict() if hasattr(frame, 'dict') else frame
     })
     
-    # Invia a tutti i client (specialmente dashboard)
+    # Send to all clients (especially dashboards)
     disconnected = set()
     for client in connected_clients:
         try:
-            # Invia solo ai dashboard, non ai sensori
+            # Send only to dashboards, not sensors
             if client.client:
                 await client.send_text(message)
         except Exception as e:
             disconnected.add(client)
-            logger.warning(f"Errore invio broadcast: {e}")
+            logger.warning(f"Error sending broadcast: {e}")
     
-    # Rimuovi client disconnessi
+    # Remove disconnected clients
     for client in disconnected:
         connected_clients.discard(client)
 

@@ -1,5 +1,16 @@
 import React, { useMemo } from 'react'
 
+/*
+######################
+#  KeypointTraces.jsx
+#
+# Component for displaying keypoint tracking traces over time
+# Shows historical positions of body joints
+#
+# Author: Michelangelo Guaitolini, 11.03.2026
+######################
+*/
+
 export function KeypointTraces({ frames, selectedKeypoints = ["nose", "left_wrist", "right_wrist"], width = 800, height = 400 }) {
   const KEYPOINT_NAMES = [
     "nose", "left_eye", "right_eye", "left_ear", "right_ear",

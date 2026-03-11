@@ -1,4 +1,17 @@
-"""Elaborazione dati motion capture"""
+####################
+#  processing/__init__.py
+#
+# Motion Capture Data Processing
+# Provides filtering, velocity calculation, and anomaly detection
+#
+# Author: Michelangelo Guaitolini, 11.03.2026
+####################
+
+__doc__ = """
+Motion Capture Data Processing
+"""
+
+"""Motion capture data processing"""
 
 from typing import Dict, List
 from app.models import MocapFrame, ProcessedFrame
@@ -7,12 +20,12 @@ from collections import deque
 
 
 class MotionProcessor:
-    """Elabora i frame da motion capture"""
+    """Process frames from motion capture"""
     
     def __init__(self, smoothing_window: int = 5):
         """
         Args:
-            smoothing_window: finestra per media mobile (frame)
+            smoothing_window: moving average window (frames)
         """
         self.smoothing_window = smoothing_window
         self.history: Dict[str, deque] = {}
@@ -20,21 +33,21 @@ class MotionProcessor:
         self.last_velocity: Dict[str, Dict[str, float]] = {}
     
     def process(self, frame: MocapFrame) -> Dict:
-        """Processa un frame"""
+        """Process a frame"""
         
-        # Estrai joint dal frame
+        # Extract joint from frame
         joints = {}
         for joint_name, pos in frame.joints.items():
             joints[joint_name] = {"x": pos[0], "y": pos[1], "z": pos[2]}
         
-        # Smoothing (media mobile)
+        # Smoothing (moving average)
         smoothed_joints = self._smooth_joints(frame.sensor_id, joints)
         
-        # Calcola velocità e accelerazione
+        # Calculate velocity and acceleration
         velocity = self._calculate_velocity(frame.sensor_id, smoothed_joints)
         acceleration = self._calculate_acceleration(frame.sensor_id, velocity)
         
-        # Rilevamento anomalie
+        # Anomaly detection
         anomalies = self._detect_anomalies(smoothed_joints, velocity, acceleration)
         
         return {
@@ -48,23 +61,23 @@ class MotionProcessor:
         }
     
     def _smooth_joints(self, sensor_id: str, joints: Dict) -> Dict[str, List[float]]:
-        """Smoothing con media mobile"""
+        """Smoothing with moving average"""
         
-        # Inizializza lo storico se necessario
+        # Initialize history if necessary
         if sensor_id not in self.history:
             self.history[sensor_id] = {}
         
         smoothed = {}
         
         for joint_name, pos in joints.items():
-            # Crea storico per questo joint se non esiste
+            # Create history for this joint if it doesn't exist
             if joint_name not in self.history[sensor_id]:
                 self.history[sensor_id][joint_name] = deque(maxlen=self.smoothing_window)
             
-            # Aggiungi il nuovo valore
+            # Add new value
             self.history[sensor_id][joint_name].append(pos)
             
-            # Media mobile
+            # Moving average
             history = list(self.history[sensor_id][joint_name])
             avg = {
                 "x": sum(p["x"] for p in history) / len(history),
@@ -77,7 +90,7 @@ class MotionProcessor:
         return smoothed
     
     def _calculate_velocity(self, sensor_id: str, joints: Dict[str, List[float]]) -> Dict[str, List[float]]:
-        """Calcola velocità differenziale"""
+        """Calculate differential velocity"""
         
         if sensor_id not in self.last_position:
             self.last_position[sensor_id] = {}
@@ -88,8 +101,8 @@ class MotionProcessor:
         for joint_name, pos in joints.items():
             if joint_name in self.last_position[sensor_id]:
                 last_pos = self.last_position[sensor_id][joint_name]
-                # Velocità = (posizione attuale - posizione precedente) / dt
-                # Assumiamo dt = 1/30 Hz = 0.033s
+                # Velocity = (current position - previous position) / dt
+                # Assume dt = 1/30 Hz = 0.033s
                 dt = 0.033
                 v = [
                     (pos[0] - last_pos[0]) / dt,

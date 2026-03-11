@@ -1,3 +1,14 @@
+/*
+######################
+#  Dashboard.jsx
+#
+# Main Dashboard Component for Motion Capture Visualization
+# Displays real-time data, charts, and recording controls
+#
+# Author: Michelangelo Guaitolini, 11.03.2026
+######################
+*/
+
 import React, { useState } from 'react'
 import { useMocapWebSocket } from '../hooks/useMocapWebSocket'
 import { SensorStatus } from './SensorStatus'
@@ -14,7 +25,7 @@ export function Dashboard() {
   const [recordedFrames, setRecordedFrames] = useState([])
   const [samplingFrequency, setSamplingFrequency] = useState(30)
   
-  // TUTTI i keypoints (sempre salvati in recording, selezionati solo per viz)
+  // ALL keypoints (always saved in recording, selected only for viz)
   const allKeypoints = [
     "nose", "left_eye", "right_eye", "left_ear", "right_ear",
     "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
@@ -66,11 +77,11 @@ export function Dashboard() {
 
   const downloadCSV = () => {
     if (recordedFrames.length === 0) {
-      alert('Nessun dato registrato')
+      alert('No recorded data')
       return
     }
 
-    // SEMPRE salva TUTTI i keypoints (con NaN se non disponibili)
+    // ALWAYS save ALL keypoints (with NaN if not available)
     let csv = 'timestamp,frame_count,sensor_id'
     allKeypoints.forEach(kpt => {
       csv += `,${kpt}_x,${kpt}_y,${kpt}_conf`
@@ -81,7 +92,7 @@ export function Dashboard() {
       csv += `${frame.timestamp},${frame.frame_count},${frame.sensor_id}`
       
       if (frame.keypoints) {
-        // Salva TUTTI i keypoints, NaN se non disponibile
+        // Save ALL keypoints, NaN if not available
         allKeypoints.forEach(kpt => {
           const kpt_data = frame.keypoints[kpt]
           if (kpt_data && kpt_data.confidence > 0) {

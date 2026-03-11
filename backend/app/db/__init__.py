@@ -1,4 +1,17 @@
-"""Database e storage per dati mocap"""
+####################
+#  db/__init__.py
+#
+# Database and Storage for Motion Capture Data
+# Provides persistent storage for frames and alerts
+#
+# Author: Michelangelo Guaitolini, 11.03.2026
+####################
+
+__doc__ = """
+Database and Storage for Motion Capture Data
+"""
+
+"""Database and storage for mocap data"""
 
 import sqlite3
 import json
@@ -8,18 +21,18 @@ import asyncio
 
 
 class DataStore:
-    """Gestisce lo storage dei dati mocap"""
+    """Manages storage of mocap data"""
     
     def __init__(self, db_path: str = "mocap_data.db"):
         self.db_path = db_path
         self.init_db()
     
     def init_db(self):
-        """Inizializza il database"""
+        """Initialize the database"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        # Tabella per i frame
+        # Table for frames
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS frames (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -31,7 +44,7 @@ class DataStore:
             )
         """)
         
-        # Tabella per alert
+        # Table for alerts
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS alerts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -48,13 +61,13 @@ class DataStore:
         conn.close()
     
     async def save_frame(self, frame_data: Dict):
-        """Salva un frame nel database"""
-        # Esegui in thread per non bloccare
+        """Save a frame to the database"""
+        # Execute in thread to not block
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, self._save_frame_sync, frame_data)
     
     def _save_frame_sync(self, frame_data: Dict):
-        """Versione sincrona di save_frame"""
+        """Synchronous version of save_frame"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
@@ -72,7 +85,7 @@ class DataStore:
         conn.close()
     
     def get_joint_history(self, joint: str, limit: int = 100) -> List[Dict]:
-        """Recupera lo storico di un joint"""
+        """Retrieve history of a joint"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
@@ -86,7 +99,7 @@ class DataStore:
         rows = cursor.fetchall()
         conn.close()
         
-        # Estrai il joint specifico da ogni frame
+        # Extract specific joint from each frame
         history = []
         for timestamp, joints_data in reversed(rows):
             joints = json.loads(joints_data)

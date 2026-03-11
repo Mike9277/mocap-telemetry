@@ -1,4 +1,17 @@
-"""Modelli Pydantic per Mocap Telemetry"""
+####################
+#  models/__init__.py
+#
+# Pydantic Models for Mocap Telemetry
+# Defines data structures for motion capture data and sensor status
+#
+# Author: Michelangelo Guaitolini, 11.03.2026
+####################
+
+__doc__ = """
+Pydantic Models for Mocap Telemetry
+"""
+
+"""Pydantic models for Mocap Telemetry"""
 
 from pydantic import BaseModel
 from typing import Dict, List, Optional
@@ -6,14 +19,14 @@ from datetime import datetime
 
 
 class JointData(BaseModel):
-    """Dati di un singolo joint"""
+    """Data of a single joint"""
     x: float
     y: float
     z: float
 
 
 class MocapFrame(BaseModel):
-    """Frame di dati motion capture"""
+    """Frame of motion capture data"""
     timestamp: int
     frame_count: int
     sensor_id: str
@@ -37,7 +50,7 @@ class MocapFrame(BaseModel):
 
 
 class ProcessedFrame(BaseModel):
-    """Frame dopo elaborazione"""
+    """Frame after processing"""
     timestamp: int
     frame_count: int
     sensor_id: str
@@ -48,7 +61,7 @@ class ProcessedFrame(BaseModel):
 
 
 class SensorStatus(BaseModel):
-    """Stato del sensore"""
+    """Sensor status"""
     sensor_id: str
     is_online: bool = False
     frame_count: int = 0
@@ -57,7 +70,7 @@ class SensorStatus(BaseModel):
 
 
 class AlertEvent(BaseModel):
-    """Evento di alert"""
+    """Alert event"""
     timestamp: int
     sensor_id: str
     alert_type: str  # "spike", "anomaly", "disconnection"

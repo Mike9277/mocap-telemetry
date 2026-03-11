@@ -1,6 +1,17 @@
 import React, { useMemo } from 'react'
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts'
 
+/*
+######################
+#  KeypointXYTraces.jsx
+#
+# Component for displaying 2D keypoint traces in X-Y plane
+# Visualizes movement patterns in 2D space
+#
+# Author: Michelangelo Guaitolini, 11.03.2026
+######################
+*/
+
 export function KeypointXYTraces({ frames, selectedKeypoints = ["nose", "left_wrist", "right_wrist"] }) {
   const data = useMemo(() => {
     if (!frames || frames.length === 0) return []

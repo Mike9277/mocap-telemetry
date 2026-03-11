@@ -1,3 +1,14 @@
+/*
+######################
+#  useMocapWebSocket.js
+#
+# WebSocket Hook for Real-Time Motion Capture Data
+# Connects to backend and manages frame streaming
+#
+# Author: Michelangelo Guaitolini, 11.03.2026
+######################
+*/
+
 import { useEffect, useState, useRef, useCallback } from 'react'
 
 export function useMocapWebSocket(url = 'ws://localhost:8002') {
@@ -12,7 +23,7 @@ export function useMocapWebSocket(url = 'ws://localhost:8002') {
     wsRef.current = ws
 
     ws.onopen = () => {
-      console.log('✓ WebSocket connesso')
+      console.log('✓ WebSocket connected')
       setIsConnected(true)
       setError(null)
     }
@@ -21,21 +32,21 @@ export function useMocapWebSocket(url = 'ws://localhost:8002') {
       try {
         const message = JSON.parse(event.data)
         
-        // Supporta sia il formato mocap_frame che il nuovo formato pose detection
+        // Support both mocap_frame format and new pose detection format
         if (message.type === 'mocap_frame') {
           setFrames(prev => {
             const updated = [...prev, message.data]
             return updated.slice(-100)
           })
         } else if (message.keypoints || message.has_person !== undefined) {
-          // Nuovo formato YOLOv8 Pose Detection
+          // New YOLOv8 Pose Detection format
           setPoseData(message)
           
-          // Debug: mostra se il video è presente
+          // Debug: show if video is present
           if (message.video) {
-            console.log(`✓ Video ricevuto (${message.video.length} bytes), frame: ${message.frame_count}`)
+            console.log(`✓ Video received (${message.video.length} bytes), frame: ${message.frame_count}`)
           } else {
-            console.warn(`⚠️ Video NON presente nel frame ${message.frame_count}`)
+            console.warn(`⚠️ Video NOT present in frame ${message.frame_count}`)
           }
           
           setFrames(prev => {
@@ -44,18 +55,18 @@ export function useMocapWebSocket(url = 'ws://localhost:8002') {
           })
         }
       } catch (err) {
-        console.error('Errore parsing WebSocket:', err)
+        console.error('Error parsing WebSocket:', err)
       }
     }
 
     ws.onerror = (event) => {
       console.error('✗ WebSocket error:', event)
-      setError('Connessione WebSocket non disponibile')
+      setError('WebSocket connection not available')
       setIsConnected(false)
     }
 
     ws.onclose = () => {
-      console.log('✗ WebSocket chiuso')
+      console.log('✗ WebSocket closed')
       setIsConnected(false)
     }
 

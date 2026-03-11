@@ -1,3 +1,25 @@
+/*
+######################
+#  JointChart.jsx
+#
+# Component for displaying motion capture joint data as time series charts
+# Shows X, Y, Z coordinates over time with smooth line visualization
+#
+# Author: Michelangelo Guaitolini, 11.03.2026
+######################
+*/
+
+/*
+######################
+#  JointChart.jsx
+#
+# Component for displaying motion capture joint data as time series charts
+# Shows X, Y, Z coordinates over time with smooth line visualization
+#
+# Author: Michelangelo Guaitolini, 11.03.2026
+######################
+*/
+
 import React, { useMemo } from 'react'
 import {
   LineChart,
