@@ -19,7 +19,7 @@ export function useMocapWebSocket(url = 'ws://localhost:8002') {
   const [jointAngles, setJointAngles] = useState({})        // latest angles snapshot
   const [angleHistory, setAngleHistory] = useState({})      // name → [last N values]
 
-  const HISTORY_LEN = 100
+  const HISTORY_LEN = 120
   const wsRef = useRef(null)
 
   useEffect(() => {
