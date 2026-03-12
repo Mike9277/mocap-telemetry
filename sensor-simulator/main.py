@@ -1,364 +1,339 @@
 ####################
 #  main.py
 #
-# Real-time Pose Detection Sensor
-# Uses YOLOv8 to detect body keypoints in real-time from webcam
-# Sends data via WebSocket to the backend
+# Real-time Wholebody Pose Detection Sensor
+# Uses MediaPipe Tasks API (0.10.30+)
+#   - PoseLandmarker  : body 33 pts
+#   - HandLandmarker  : hands 21 pts x 2
+# Computes joint angles in real-time via angle_utils
+# Sends enriched data via WebSocket to the backend
 #
-# Author: Michelangelo Guaitolini, 11.03.2026
+# Author: Michelangelo Guaitolini, 12.03.2026
 ####################
-
-__doc__ = """
-Real-time Pose Detection Sensor
-Uses YOLOv8 to detect body keypoints in real-time from webcam.
-Sends data via WebSocket to the backend.
-"""
 
 import asyncio
 import base64
-import io
 import json
+import os
 import time
-from datetime import datetime
-from typing import Dict, List, Tuple, Optional
+import urllib.request
+from typing import Dict, List, Optional
 
 import cv2
+import mediapipe as mp
 import numpy as np
-from PIL import Image
-from ultralytics import YOLO
 import websockets
 from websockets.asyncio.client import ClientConnection
 
+from angle_utils import compute_all_angles
 
-class PoseDetectionSensor:
-    """Detects human body poses using YOLOv8"""
-    
-    # Sensor frequency (Hz) - limited to 24 FPS for HD
-    FREQUENCY = 24
+# -- MediaPipe Tasks API -------------------------------------------------------
+BaseOptions        = mp.tasks.BaseOptions
+PoseLandmarker     = mp.tasks.vision.PoseLandmarker
+PoseLandmarkerOpts = mp.tasks.vision.PoseLandmarkerOptions
+HandLandmarker     = mp.tasks.vision.HandLandmarker
+HandLandmarkerOpts = mp.tasks.vision.HandLandmarkerOptions
+RunningMode        = mp.tasks.vision.RunningMode
+
+draw_utils  = mp.tasks.vision.drawing_utils
+draw_styles = mp.tasks.vision.drawing_styles
+DrawingSpec = mp.tasks.vision.drawing_utils.DrawingSpec
+
+PoseConns = mp.tasks.vision.PoseLandmarksConnections.POSE_LANDMARKS
+HandConns = mp.tasks.vision.HandLandmarksConnections.HAND_CONNECTIONS
+
+# -- Model paths & URLs --------------------------------------------------------
+MODEL_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+POSE_MODEL = os.path.join(MODEL_DIR, "pose_landmarker_full.task")
+HAND_MODEL = os.path.join(MODEL_DIR, "hand_landmarker.task")
+
+POSE_URL = ("https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
+            "pose_landmarker_full/float16/latest/pose_landmarker_full.task")
+HAND_URL = ("https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
+            "hand_landmarker/float16/latest/hand_landmarker.task")
+
+
+def _download(url: str, dest: str) -> None:
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    print(f"  Downloading {os.path.basename(dest)} ...")
+    urllib.request.urlretrieve(url, dest)
+    print(f"  OK  {dest}")
+
+
+def ensure_models() -> None:
+    if not os.path.exists(POSE_MODEL):
+        _download(POSE_URL, POSE_MODEL)
+    else:
+        print(f"  OK  {os.path.basename(POSE_MODEL)}")
+    if not os.path.exists(HAND_MODEL):
+        _download(HAND_URL, HAND_MODEL)
+    else:
+        print(f"  OK  {os.path.basename(HAND_MODEL)}")
+
+
+# -- Landmark name tables ------------------------------------------------------
+POSE_LANDMARK_NAMES = [
+    "nose",
+    "left_eye_inner", "left_eye", "left_eye_outer",
+    "right_eye_inner", "right_eye", "right_eye_outer",
+    "left_ear", "right_ear",
+    "mouth_left", "mouth_right",
+    "left_shoulder", "right_shoulder",
+    "left_elbow", "right_elbow",
+    "left_wrist", "right_wrist",
+    "left_pinky", "right_pinky",
+    "left_index", "right_index",
+    "left_thumb", "right_thumb",
+    "left_hip", "right_hip",
+    "left_knee", "right_knee",
+    "left_ankle", "right_ankle",
+    "left_heel", "right_heel",
+    "left_foot_index", "right_foot_index",
+]
+
+HAND_LANDMARK_NAMES = [
+    "wrist",
+    "thumb_cmc", "thumb_mcp", "thumb_ip", "thumb_tip",
+    "index_finger_mcp", "index_finger_pip", "index_finger_dip", "index_finger_tip",
+    "middle_finger_mcp", "middle_finger_pip", "middle_finger_dip", "middle_finger_tip",
+    "ring_finger_mcp", "ring_finger_pip", "ring_finger_dip", "ring_finger_tip",
+    "pinky_mcp", "pinky_pip", "pinky_dip", "pinky_tip",
+]
+
+
+# -- Sensor --------------------------------------------------------------------
+class WholeBodySensor:
+    FREQUENCY      = 24
     FRAME_INTERVAL = 1.0 / FREQUENCY
-    
-    # Keypoint names from YOLOv8 (17 keypoints)
-    KEYPOINT_NAMES = [
-        "nose", "left_eye", "right_eye", "left_ear", "right_ear",
-        "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
-        "left_wrist", "right_wrist", "left_hip", "right_hip",
-        "left_knee", "right_knee", "left_ankle", "right_ankle"
-    ]
-    
-    # Skeleton connections (for drawing lines)
-    SKELETON_CONNECTIONS = [
-        (0, 1), (0, 2), (1, 3), (2, 4),  # Head
-        (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),  # Arms
-        (5, 11), (6, 12), (11, 12),  # Torso
-        (11, 13), (13, 15), (12, 14), (14, 16)  # Legs
-    ]
-    
-    def __init__(self, sensor_id: str = "yolo_pose_001", camera_index: int = 0):
-        self.sensor_id = sensor_id
+
+    def __init__(self, sensor_id: str = "mediapipe_wholebody_001", camera_index: int = 0):
+        self.sensor_id   = sensor_id
         self.frame_count = 0
-        self.start_time = time.time()
-        
-        # Load YOLOv8 Pose model
-        print("📥 Loading YOLOv8 Pose model...")
-        self.model = YOLO("yolov8m-pose.pt")  # medium model per velocità/accuratezza
-        
-        # Open webcam
-        print(f"📷 Opening webcam (camera {camera_index})...")
-        self.cap = cv2.VideoCapture(camera_index)
-        
-        if not self.cap.isOpened():
-            raise RuntimeError(f"Unable to open webcam: {camera_index}")
-        
-        # Set resolution to HD (1280x720) and FPS to 24
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        self.cap.set(cv2.CAP_PROP_FPS, 24)
-        
-        # Buffer for tracking (last 100 frames)
-        self.keypoint_history = {name: [] for name in self.KEYPOINT_NAMES}
-        self.max_history_length = 100
-        
+        self.start_time  = time.time()
         self.websocket: Optional[ClientConnection] = None
-        self.last_inference_time = 0.0
-        self.inference_fps = 0.0
-    
-    def _process_frame(self, frame: np.ndarray) -> Dict:
-        """Process a frame from webcam and extract keypoints"""
-        
-        # Run YOLOv8 inference
-        results = self.model(frame, verbose=False, conf=0.6, iou=0.5)
-        
-        # Frame data structure
-        frame_data = {
-            "timestamp": int(time.time() * 1000),
-            "frame_count": self.frame_count,
-            "sensor_id": self.sensor_id,
-            "image_shape": list(frame.shape[:2]),  # height, width
-            "joints": {},
-            "keypoints": {},
-            "has_person": False
-        }
-        
-        # Extract keypoints from first detected person (closest)
-        if results and results[0].keypoints is not None:
-            keypoints = results[0].keypoints.xy[0].cpu().numpy()  # (17, 2) - x, y
-            confidences = results[0].keypoints.conf[0].cpu().numpy() if hasattr(results[0].keypoints, 'conf') else np.ones(17)
-            
-            frame_data["has_person"] = True
-            
-            # Normalize coordinates (0-1)
-            h, w = frame.shape[:2]
-            keypoints_normalized = keypoints.copy()
-            keypoints_normalized[:, 0] /= w  # x
-            keypoints_normalized[:, 1] /= h  # y
-            
-            # Save keypoints for tracking
-            for i, name in enumerate(self.KEYPOINT_NAMES):
-                x_norm = float(keypoints_normalized[i, 0])
-                y_norm = float(keypoints_normalized[i, 1])
-                conf = float(confidences[i])
-                
-                # Formato: [x_normalized, y_normalized, confidence]
-                frame_data["keypoints"][name] = {
-                    "x": x_norm,
-                    "y": y_norm,
-                    "confidence": conf,
-                    "x_pixel": int(keypoints[i, 0]),
-                    "y_pixel": int(keypoints[i, 1])
-                }
-                
-                # Keep history (for tracking)
-                self.keypoint_history[name].append({
-                    "x": x_norm,
-                    "y": y_norm,
-                    "confidence": conf,
-                    "timestamp": frame_data["timestamp"]
-                })
-                
-                # Limit history length
-                if len(self.keypoint_history[name]) > self.max_history_length:
-                    self.keypoint_history[name].pop(0)
-            
-            # Create simplified "joints" data (backwards compatible)
-            frame_data["joints"] = {
-                "head": [
-                    frame_data["keypoints"]["nose"]["x"],
-                    frame_data["keypoints"]["nose"]["y"],
-                    frame_data["keypoints"]["nose"]["confidence"]
-                ],
-                "shoulder_left": [
-                    frame_data["keypoints"]["left_shoulder"]["x"],
-                    frame_data["keypoints"]["left_shoulder"]["y"],
-                    frame_data["keypoints"]["left_shoulder"]["confidence"]
-                ],
-                "shoulder_right": [
-                    frame_data["keypoints"]["right_shoulder"]["x"],
-                    frame_data["keypoints"]["right_shoulder"]["y"],
-                    frame_data["keypoints"]["right_shoulder"]["confidence"]
-                ],
-                "hand_left": [
-                    frame_data["keypoints"]["left_wrist"]["x"],
-                    frame_data["keypoints"]["left_wrist"]["y"],
-                    frame_data["keypoints"]["left_wrist"]["confidence"]
-                ],
-                "hand_right": [
-                    frame_data["keypoints"]["right_wrist"]["x"],
-                    frame_data["keypoints"]["right_wrist"]["y"],
-                    frame_data["keypoints"]["right_wrist"]["confidence"]
-                ],
+
+        print(f"Camera {camera_index} ...")
+        self.cap = cv2.VideoCapture(camera_index)
+        if not self.cap.isOpened():
+            raise RuntimeError(f"Cannot open webcam {camera_index}")
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        self.cap.set(cv2.CAP_PROP_FPS, self.FREQUENCY)
+
+        print("Models ...")
+        ensure_models()
+
+        self.pose_landmarker = PoseLandmarker.create_from_options(
+            PoseLandmarkerOpts(
+                base_options=BaseOptions(model_asset_path=POSE_MODEL),
+                running_mode=RunningMode.VIDEO,
+                num_poses=1,
+                min_pose_detection_confidence=0.5,
+                min_pose_presence_confidence=0.5,
+                min_tracking_confidence=0.5,
+            )
+        )
+        self.hand_landmarker = HandLandmarker.create_from_options(
+            HandLandmarkerOpts(
+                base_options=BaseOptions(model_asset_path=HAND_MODEL),
+                running_mode=RunningMode.VIDEO,
+                num_hands=2,
+                min_hand_detection_confidence=0.5,
+                min_hand_presence_confidence=0.5,
+                min_tracking_confidence=0.5,
+            )
+        )
+        print("Ready.\n")
+
+    # -- helpers ---------------------------------------------------------------
+
+    def _lm_to_dict(self, landmarks: list, names: List[str], h: int, w: int) -> dict:
+        out = {}
+        for i, name in enumerate(names):
+            lm = landmarks[i]
+            out[name] = {
+                "x":          round(float(lm.x), 5),
+                "y":          round(float(lm.y), 5),
+                "z":          round(float(lm.z), 5),
+                "confidence": round(float(getattr(lm, "visibility", None) or getattr(lm, "presence", None) or 1.0), 3),
+                "x_pixel":    int(lm.x * w),
+                "y_pixel":    int(lm.y * h),
             }
-        
+        return out
+
+    # -- drawing ---------------------------------------------------------------
+
+    def _draw_pose(self, frame, pose_lms):
+        draw_utils.draw_landmarks(
+            frame, pose_lms, PoseConns,
+            landmark_drawing_spec=draw_styles.get_default_pose_landmarks_style(),
+            connection_drawing_spec=DrawingSpec(color=(0, 200, 255), thickness=2),
+        )
+
+    def _draw_hand(self, frame, hand_lms, color):
+        draw_utils.draw_landmarks(
+            frame, hand_lms, HandConns,
+            landmark_drawing_spec=DrawingSpec(color=color, thickness=2, circle_radius=3),
+            connection_drawing_spec=DrawingSpec(color=color, thickness=2),
+        )
+
+    def _draw_angles(self, frame, pose_lms, angles, h, w):
+        if not pose_lms:
+            return
+        label_pos = {
+            "left_shoulder": 11, "right_shoulder": 12,
+            "left_elbow":    13, "right_elbow":    14,
+            "left_wrist":    15, "right_wrist":    16,
+            "left_hip":      23, "right_hip":      24,
+            "left_knee":     25, "right_knee":     26,
+            "left_ankle":    27, "right_ankle":    28,
+        }
+        for aname, idx in label_pos.items():
+            if aname not in angles:
+                continue
+            lm  = pose_lms[idx]
+            val = angles[aname]
+            pt  = (int(lm.x * w), int(lm.y * h))
+            label = f"{val:.0f}\u00b0"
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+            pad = 4
+            ov = frame.copy()
+            cv2.rectangle(ov, (pt[0]-tw//2-pad, pt[1]-th-pad-6),
+                              (pt[0]+tw//2+pad, pt[1]-pad-2), (10,15,20), -1)
+            cv2.addWeighted(ov, 0.7, frame, 0.3, 0, frame)
+            color = (0, 230, 255) if "left" in aname else (50, 120, 255)
+            cv2.putText(frame, label, (pt[0]-tw//2, pt[1]-pad-2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+
+    # -- frame -----------------------------------------------------------------
+
+    def _process_frame(self, frame: np.ndarray) -> dict:
+        h, w  = frame.shape[:2]
+        ts_ms = int(time.time() * 1000)
+        ts_mp = self.frame_count * int(1000 / self.FREQUENCY)
+
+        rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+
+        pose_result = self.pose_landmarker.detect_for_video(mp_img, ts_mp)
+        hand_result = self.hand_landmarker.detect_for_video(mp_img, ts_mp)
+
+        fd: dict = {
+            "timestamp":            ts_ms,
+            "frame_count":          self.frame_count,
+            "sensor_id":            self.sensor_id,
+            "image_shape":          [h, w],
+            "has_person":           False,
+            "keypoints":            {},
+            "left_hand_keypoints":  {},
+            "right_hand_keypoints": {},
+            "joint_angles":         {},
+            "joints":               {},
+        }
+
+        pose_lms = None
+        if pose_result.pose_landmarks:
+            pose_lms         = pose_result.pose_landmarks[0]
+            fd["has_person"] = True
+            fd["keypoints"]  = self._lm_to_dict(pose_lms, POSE_LANDMARK_NAMES, h, w)
+            kp = fd["keypoints"]
+            fd["joints"] = {
+                "head":           [kp["nose"]["x"],           kp["nose"]["y"],           kp["nose"]["confidence"]],
+                "shoulder_left":  [kp["left_shoulder"]["x"],  kp["left_shoulder"]["y"],  kp["left_shoulder"]["confidence"]],
+                "shoulder_right": [kp["right_shoulder"]["x"], kp["right_shoulder"]["y"], kp["right_shoulder"]["confidence"]],
+                "hand_left":      [kp["left_wrist"]["x"],     kp["left_wrist"]["y"],     kp["left_wrist"]["confidence"]],
+                "hand_right":     [kp["right_wrist"]["x"],    kp["right_wrist"]["y"],    kp["right_wrist"]["confidence"]],
+            }
+            self._draw_pose(frame, pose_lms)
+
+        left_hand_lms = right_hand_lms = None
+        if hand_result.hand_landmarks:
+            for i, hand_lms in enumerate(hand_result.hand_landmarks):
+                side = hand_result.handedness[i][0].category_name
+                if side == "Left":
+                    left_hand_lms           = hand_lms
+                    fd["left_hand_keypoints"] = self._lm_to_dict(hand_lms, HAND_LANDMARK_NAMES, h, w)
+                    self._draw_hand(frame, hand_lms, (57, 255, 20))
+                else:
+                    right_hand_lms            = hand_lms
+                    fd["right_hand_keypoints"] = self._lm_to_dict(hand_lms, HAND_LANDMARK_NAMES, h, w)
+                    self._draw_hand(frame, hand_lms, (0, 100, 255))
+
+        fd["joint_angles"] = compute_all_angles(
+            pose_landmarks=pose_lms,
+            left_hand_landmarks=left_hand_lms,
+            right_hand_landmarks=right_hand_lms,
+        )
+        self._draw_angles(frame, pose_lms, fd["joint_angles"], h, w)
+
         self.frame_count += 1
-        return frame_data
-    
-    def get_keypoint_traces(self, keypoint_name: str, max_points: int = 50) -> List[Dict]:
-        """Returns the historical trace of a keypoint"""
-        history = self.keypoint_history.get(keypoint_name, [])
-        # Return only the last max_points
-        return history[-max_points:] if history else []
-    
-    def _encode_frame_to_base64(self, frame: np.ndarray, quality: int = 70) -> str:
-        """Encode the frame as base64 JPEG for WebSocket transmission"""
-        # Compress HD frame with JPEG
-        _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
-        # Convert to base64
-        frame_base64 = base64.b64encode(buffer).decode('utf-8')
-        return frame_base64
-    
+        return fd
+
+    def _encode(self, frame: np.ndarray, quality: int = 72) -> str:
+        _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        return base64.b64encode(buf).decode("utf-8")
+
+    # -- websocket -------------------------------------------------------------
+
     async def stream_to_websocket(self, uri: str) -> None:
-        """Capture from webcam and send data via WebSocket"""
         try:
-            async with websockets.connect(uri) as websocket:
-                self.websocket = websocket
-                print(f"✓ Connected to {uri}")
-                print(f"✓ Starting stream from {self.sensor_id}")
-                print("  Press 'q' in the webcam window to stop\n")
-                
-                frame_skip_counter = 0
-                target_skip = max(1, int(30 / self.FREQUENCY))  # Skip frame if necessary
-                
+            async with websockets.connect(uri, max_size=10 * 1024 * 1024) as ws:
+                print(f"Connected to {uri}")
+                next_t = time.perf_counter()
                 while True:
+                    now = time.perf_counter()
+                    if now < next_t:
+                        await asyncio.sleep(next_t - now)
                     ret, frame = self.cap.read()
-                    
                     if not ret:
-                        print("✗ Error reading webcam")
-                        break
-                    
-                    # Skip frame if necessary to maintain frequency
-                    frame_skip_counter += 1
-                    if frame_skip_counter < target_skip:
+                        await asyncio.sleep(0.05)
                         continue
-                    frame_skip_counter = 0
-                    
-                    # Process the frame
-                    frame_data = self._process_frame(frame)
-                    
-                    # Display preview and extract the drawn frame
-                    self._draw_skeleton(frame, frame_data)
-                    
-                    # Mostra FPS e info
-                    fps_text = f"FPS: {self.inference_fps:.1f} | Frames: {self.frame_count}"
-                    cv2.putText(frame, fps_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                    
-                    if frame_data["has_person"]:
-                        cv2.putText(frame, f"Person detected: {len(frame_data['keypoints'])} keypoints", 
-                                  (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                    else:
-                        cv2.putText(frame, "No person detected", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-                    
-                    # Send video frame EVERY FRAME in HD with medium quality
+                    frame = cv2.flip(frame, 1)
+                    fd = self._process_frame(frame)
+                    fd["video"] = self._encode(frame)
                     try:
-                        video_base64 = self._encode_frame_to_base64(frame, quality=35)
-                        frame_data["video"] = video_base64
-                    except Exception as e:
-                        print(f"⚠️  Error encoding video at frame {self.frame_count}: {e}")
-                        frame_data["video"] = None
-                    
-                    # Send the data
-                    try:
-                        await websocket.send(json.dumps(frame_data, default=str))
-                        
-                        # Log every 30 frames
-                        if self.frame_count % 30 == 0:
-                            joint_str = f"Head: ({frame_data['joints']['head'][0]:.2f}, {frame_data['joints']['head'][1]:.2f})"
-                            print(f"  Frame {self.frame_count} sent | {joint_str}")
-                        
-                    # Calculate FPS
-                        now = time.time()
-                        if self.last_inference_time > 0:
-                            fps = 1.0 / (now - self.last_inference_time)
-                            self.inference_fps = self.inference_fps * 0.7 + fps * 0.3  # Smoothing
-                        self.last_inference_time = now
-                        
-                        # Throttle to max 24 FPS
-                        elapsed = time.time() - now
-                        sleep_time = max(0, 1.0/24.0 - elapsed)
-                        if sleep_time > 0:
-                            time.sleep(sleep_time)
-                    
+                        await ws.send(json.dumps(fd))
                     except websockets.exceptions.ConnectionClosed:
-                        print("✗ Connection closed by server")
+                        print("Connection closed.")
                         break
-                    
-                    # Check keys
-                    key = cv2.waitKey(1) & 0xFF
-                    if key == ord('q'):
-                        print("✓ User interrupt")
-                        break
-        
-        except ConnectionRefusedError:
-            print(f"✗ Error: Unable to connect to {uri}")
-            print("  Make sure backend is running: python backend/server.py")
-        
-        except Exception as e:
-            print(f"✗ Error: {e}")
-        
+                    if self.frame_count % 30 == 0:
+                        e   = time.time() - self.start_time
+                        fps = self.frame_count / e if e > 0 else 0
+                        na  = len(fd["joint_angles"])
+                        lh  = "OK" if fd["left_hand_keypoints"]  else "--"
+                        rh  = "OK" if fd["right_hand_keypoints"] else "--"
+                        print(f"frame {self.frame_count:5d} | {fps:4.1f} fps | angles {na:2d} | LH {lh} | RH {rh}")
+                    next_t += self.FRAME_INTERVAL
+        except (OSError, ConnectionRefusedError):
+            print(f"Connection refused: {uri}\n  Start backend first.")
         finally:
             self.cap.release()
-            cv2.destroyAllWindows()
-    
-    def _draw_skeleton(self, frame: np.ndarray, frame_data: Dict) -> None:
-        """Draw skeleton on frame with different left/right colors"""
-        
-        if not frame_data["has_person"]:
-            return
-        
-        h, w = frame.shape[:2]
-        
-        # Draw connections (lines) with left/right colors
-        for start_idx, end_idx in self.SKELETON_CONNECTIONS:
-            start_name = self.KEYPOINT_NAMES[start_idx]
-            end_name = self.KEYPOINT_NAMES[end_idx]
-            
-            if start_name in frame_data["keypoints"] and end_name in frame_data["keypoints"]:
-                start_point = frame_data["keypoints"][start_name]
-                end_point = frame_data["keypoints"][end_name]
-                
-                # Draw only if confidence is high
-                if start_point["confidence"] > 0.3 and end_point["confidence"] > 0.3:
-                    pt1 = (start_point["x_pixel"], start_point["y_pixel"])
-                    pt2 = (end_point["x_pixel"], end_point["y_pixel"])
-                    
-                    # Color: BLUE for "left", RED for "right", GREEN for center (head, torso)
-                    conf = (start_point["confidence"] + end_point["confidence"]) / 2
-                    intensity = int(255 * conf)
-                    
-                    if "left" in start_name or "left" in end_name:
-                        color = (255, 0, 0)  # BLUE (BGR format)
-                    elif "right" in start_name or "right" in end_name:
-                        color = (0, 0, 255)  # RED (BGR format)
-                    else:
-                        color = (0, 255, 0)  # GREEN (BGR format)
-                    
-                    cv2.line(frame, pt1, pt2, color, 2)
-        
-        # Draw keypoints (circles) with left/right colors
-        for name, kpt in frame_data["keypoints"].items():
-            if kpt["confidence"] > 0.3:
-                pt = (kpt["x_pixel"], kpt["y_pixel"])
-                
-                # Same colors: BLUE/RED/GREEN
-                conf = kpt["confidence"]
-                intensity = int(255 * conf)
-                
-                if "left" in name:
-                    color = (255, 0, 0)  # BLUE
-                elif "right" in name:
-                    color = (0, 0, 255)  # RED
-                else:
-                    color = (0, 255, 0)  # GREEN
-                
-                cv2.circle(frame, pt, 5, color, -1)
-                cv2.circle(frame, pt, 5, (255, 255, 255), 1)
+            self.pose_landmarker.close()
+            self.hand_landmarker.close()
+            print("Sensor stopped.")
 
 
+# -- Entry point ---------------------------------------------------------------
 async def main():
-    """Main entry point"""
-    print("=" * 60)
-    print("🎯 Real-time Pose Detection Sensor (YOLOv8)")
-    print("=" * 60)
-    print()
-    
-    try:
-        # Create the sensor
-        sensor = PoseDetectionSensor(sensor_id="yolo_pose_001", camera_index=0)
-        
-        # Connect and start streaming
-        backend_uri = "ws://localhost:8001"
-        await sensor.stream_to_websocket(backend_uri)
-    
-    except KeyboardInterrupt:
-        print("\n✓ Shutdown requested")
-    except RuntimeError as e:
-        print(f"\n✗ Error: {e}")
-        print("  Make sure that:")
-        print("    1. A webcam is connected and working")
-        print("    2. Backend is running (python backend/server.py)")
-    except Exception as e:
-        print(f"\n✗ Unexpected error: {e}")
-        import traceback
-        traceback.print_exc()
+    print("=" * 55)
+    print("  Wholebody Sensor - MediaPipe Tasks API 0.10.30+")
+    print("=" * 55)
+    sensor = WholeBodySensor(sensor_id="mediapipe_wholebody_001", camera_index=0)
+    uri = "ws://localhost:8001"
+    while True:
+        try:
+            await sensor.stream_to_websocket(uri)
+        except KeyboardInterrupt:
+            break
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            print("Retrying in 3 s ...")
+            await asyncio.sleep(3)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Stopped.")
