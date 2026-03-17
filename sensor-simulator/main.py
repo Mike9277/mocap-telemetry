@@ -6,6 +6,7 @@
 #   - PoseLandmarker  : body 33 pts
 #   - HandLandmarker  : hands 21 pts x 2
 # Computes joint angles in real-time via angle_utils
+# 2D to 3D pose lifting via pose_lifter
 # Sends enriched data via WebSocket to the backend
 #
 # Author: Michelangelo Guaitolini, 12.03.2026
@@ -25,9 +26,33 @@ import numpy as np
 import websockets
 from websockets.asyncio.client import ClientConnection
 
-from angle_utils import compute_all_angles
+from angle_utils import compute_all_angles, compute_virtual_landmarks
+from pose_lifter import create_pose_lifter, SimplePoseLifter
 
-# -- MediaPipe Tasks API -------------------------------------------------------
+
+# Temporal smoothing for angles
+class AngleSmoothing:
+    """Lightweight EMA (exponential moving average) smoothing for angles."""
+    def __init__(self, alpha: float = 0.3):
+        self.alpha = alpha
+        self.prev = {}
+
+    def smooth(self, angles: dict) -> dict:
+        """Apply EMA smoothing to angles dict. Skips NaN values."""
+        out = {}
+        for key, val in angles.items():
+            if isinstance(val, float) and np.isnan(val):
+                out[key] = val
+                self.prev[key] = None
+            else:
+                if key in self.prev and self.prev[key] is not None:
+                    out[key] = self.alpha * val + (1.0 - self.alpha) * self.prev[key]
+                else:
+                    out[key] = val
+                self.prev[key] = out[key]
+        return out
+
+# MediaPipe Tasks API
 BaseOptions        = mp.tasks.BaseOptions
 PoseLandmarker     = mp.tasks.vision.PoseLandmarker
 PoseLandmarkerOpts = mp.tasks.vision.PoseLandmarkerOptions
@@ -42,7 +67,7 @@ DrawingSpec = mp.tasks.vision.drawing_utils.DrawingSpec
 PoseConns = mp.tasks.vision.PoseLandmarksConnections.POSE_LANDMARKS
 HandConns = mp.tasks.vision.HandLandmarksConnections.HAND_CONNECTIONS
 
-# -- Model paths & URLs --------------------------------------------------------
+# Model paths and URLs
 MODEL_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
 POSE_MODEL = os.path.join(MODEL_DIR, "pose_landmarker_full.task")
 HAND_MODEL = os.path.join(MODEL_DIR, "hand_landmarker.task")
@@ -70,8 +95,7 @@ def ensure_models() -> None:
     else:
         print(f"  OK  {os.path.basename(HAND_MODEL)}")
 
-
-# -- Landmark name tables ------------------------------------------------------
+# Landmark name tables
 POSE_LANDMARK_NAMES = [
     "nose",
     "left_eye_inner", "left_eye", "left_eye_outer",
@@ -101,7 +125,7 @@ HAND_LANDMARK_NAMES = [
 ]
 
 
-# -- Sensor --------------------------------------------------------------------
+# Sensor
 class WholeBodySensor:
     FREQUENCY      = 24
     FRAME_INTERVAL = 1.0 / FREQUENCY
@@ -111,6 +135,9 @@ class WholeBodySensor:
         self.frame_count = 0
         self.start_time  = time.time()
         self.websocket: Optional[ClientConnection] = None
+        self.angle_smoother = AngleSmoothing(alpha=0.25)
+        # Use improved pose lifter with MediaPipe Z and smoothing
+        self.pose_lifter = create_pose_lifter('improved', smoothing_alpha=0.25)
 
         print(f"Camera {camera_index} ...")
         self.cap = cv2.VideoCapture(camera_index)
@@ -145,8 +172,7 @@ class WholeBodySensor:
         )
         print("Ready.\n")
 
-    # -- helpers ---------------------------------------------------------------
-
+    # helpers
     def _lm_to_dict(self, landmarks: list, names: List[str], h: int, w: int) -> dict:
         out = {}
         for i, name in enumerate(names):
@@ -161,8 +187,7 @@ class WholeBodySensor:
             }
         return out
 
-    # -- drawing ---------------------------------------------------------------
-
+    # drawing
     def _draw_pose(self, frame, pose_lms):
         draw_utils.draw_landmarks(
             frame, pose_lms, PoseConns,
@@ -205,8 +230,7 @@ class WholeBodySensor:
             cv2.putText(frame, label, (pt[0]-tw//2, pt[1]-pad-2),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
 
-    # -- frame -----------------------------------------------------------------
-
+    # frame processing
     def _process_frame(self, frame: np.ndarray) -> dict:
         h, w  = frame.shape[:2]
         ts_ms = int(time.time() * 1000)
@@ -225,6 +249,7 @@ class WholeBodySensor:
             "image_shape":          [h, w],
             "has_person":           False,
             "keypoints":            {},
+            "keypoints_3d":         {},
             "left_hand_keypoints":  {},
             "right_hand_keypoints": {},
             "joint_angles":         {},
@@ -236,6 +261,10 @@ class WholeBodySensor:
             pose_lms         = pose_result.pose_landmarks[0]
             fd["has_person"] = True
             fd["keypoints"]  = self._lm_to_dict(pose_lms, POSE_LANDMARK_NAMES, h, w)
+            
+            # Lift 2D keypoints to 3D
+            fd["keypoints_3d"] = self.pose_lifter.lift_pose(fd["keypoints"])
+            
             kp = fd["keypoints"]
             fd["joints"] = {
                 "head":           [kp["nose"]["x"],           kp["nose"]["y"],           kp["nose"]["confidence"]],
@@ -259,22 +288,23 @@ class WholeBodySensor:
                     fd["right_hand_keypoints"] = self._lm_to_dict(hand_lms, HAND_LANDMARK_NAMES, h, w)
                     self._draw_hand(frame, hand_lms, (0, 100, 255))
 
-        fd["joint_angles"] = compute_all_angles(
+        raw_angles = compute_all_angles(
             pose_landmarks=pose_lms,
             left_hand_landmarks=left_hand_lms,
             right_hand_landmarks=right_hand_lms,
         )
+        fd["joint_angles"] = self.angle_smoother.smooth(raw_angles)
         self._draw_angles(frame, pose_lms, fd["joint_angles"], h, w)
 
         self.frame_count += 1
         return fd
 
+
     def _encode(self, frame: np.ndarray, quality: int = 72) -> str:
         _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
         return base64.b64encode(buf).decode("utf-8")
 
-    # -- websocket -------------------------------------------------------------
-
+    # websocket streaming
     async def stream_to_websocket(self, uri: str) -> None:
         try:
             async with websockets.connect(uri, max_size=10 * 1024 * 1024) as ws:
@@ -302,7 +332,9 @@ class WholeBodySensor:
                         na  = len(fd["joint_angles"])
                         lh  = "OK" if fd["left_hand_keypoints"]  else "--"
                         rh  = "OK" if fd["right_hand_keypoints"] else "--"
-                        print(f"frame {self.frame_count:5d} | {fps:4.1f} fps | angles {na:2d} | LH {lh} | RH {rh}")
+                        has_kpts = "keypoints" in fd
+                        has_kpts3d = "keypoints_3d" in fd
+                        print(f"frame {self.frame_count:5d} | {fps:4.1f} fps | angles {na:2d} | LH {lh} | RH {rh} | keypoints: {has_kpts} | 3D: {has_kpts3d}")
                     next_t += self.FRAME_INTERVAL
         except (OSError, ConnectionRefusedError):
             print(f"Connection refused: {uri}\n  Start backend first.")
@@ -313,10 +345,11 @@ class WholeBodySensor:
             print("Sensor stopped.")
 
 
-# -- Entry point ---------------------------------------------------------------
+# Entry point
 async def main():
     print("=" * 55)
     print("  Wholebody Sensor - MediaPipe Tasks API 0.10.30+")
+    print("  2D to 3D Pose Lifting Enabled")
     print("=" * 55)
     sensor = WholeBodySensor(sensor_id="mediapipe_wholebody_001", camera_index=0)
     uri = "ws://localhost:8001"

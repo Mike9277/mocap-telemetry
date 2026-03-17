@@ -65,13 +65,14 @@ const BODY_ANGLE_GROUPS = [
 
 const HAND_FINGERS = ['thumb', 'index', 'middle', 'ring', 'pinky']
 
-function Sparkline({ data, color }) {
+function Sparkline({ data, color, domain }) {
   const chartData = useMemo(() => (data || []).map((v, i) => ({ i, v })), [data])
   if (!data || data.length < 2) return <div className="h-8 bg-gray-700 rounded opacity-20" />
+  const yDomain = domain && domain.length === 2 ? domain : ['auto', 'auto']
   return (
     <ResponsiveContainer width="100%" height={32}>
       <LineChart data={chartData} margin={{ top: 1, right: 1, bottom: 1, left: 1 }}>
-        <YAxis domain={['auto', 'auto']} hide />
+        <YAxis domain={yDomain} hide />
         <Tooltip
           contentStyle={{ background: '#1e293b', border: 'none', fontSize: 10, padding: '2px 6px' }}
           formatter={v => [`${typeof v === 'number' ? v.toFixed(1) : v}°`, '']}
@@ -85,6 +86,17 @@ function Sparkline({ data, color }) {
 
 function AngleCard({ angleKey, label, color, value, history }) {
   const hasVal = value != null && !isNaN(value)
+  // Fixed Y domains per clinical conventions
+  let fixedDomain
+  if (angleKey?.endsWith('elbow_flexion')) {
+    fixedDomain = [0, 150]
+  } else if (angleKey?.endsWith('shoulder_flexion')) {
+    fixedDomain = [-45, 180]
+  } else if (angleKey?.endsWith('shoulder_abduction')) {
+    fixedDomain = [0, 180]
+  } else if (angleKey?.endsWith('shoulder_rotation')) {
+    fixedDomain = [-70, 90]
+  }
   return (
     <div className="bg-gray-900 rounded border border-gray-700 p-2 flex flex-col gap-1">
       <div className="flex items-baseline justify-between">
@@ -94,7 +106,7 @@ function AngleCard({ angleKey, label, color, value, history }) {
           {hasVal ? `${value > 0 ? '+' : ''}${value.toFixed(1)}°` : '—'}
         </span>
       </div>
-      <Sparkline data={history || []} color={color} />
+      <Sparkline data={(history || []).slice(-100)} color={color} domain={fixedDomain} />
     </div>
   )
 }

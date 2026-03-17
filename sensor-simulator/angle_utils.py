@@ -135,6 +135,77 @@ def _build_cs(e_y: np.ndarray, e_x_approx: np.ndarray) -> np.ndarray:
     e_x = _norm(np.cross(e_y, e_z))         # re-orthogonalise
     return np.column_stack([e_x, e_y, e_z])  # 3×3
 
+def elbow_angle(sh, el, wr) -> float:
+    """
+    Clinical elbow flexion angle (0° = full extension, ~150° = max flexion).
+    Computed as the angle between upper-arm (shoulder→elbow)
+    and forearm (wrist→elbow) vectors. Returns NaN if vectors are ill-defined.
+    
+    Note: We use (shoulder→elbow) and (wrist→elbow) so that when the arm is
+    straight, the vectors point in opposite directions (dot product ≈ -1, angle ≈ 180°).
+    We then compute 180° - angle to get 0° for extension.
+    """
+    ua = el - sh  # shoulder → elbow
+    fa = el - wr  # wrist → elbow
+
+    nua = np.linalg.norm(ua)
+    nfa = np.linalg.norm(fa)
+    if nua < 1e-6 or nfa < 1e-6:
+        return float('nan')
+
+    ua /= nua
+    fa /= nfa
+
+    dot = float(np.clip(np.dot(ua, fa), -1.0, 1.0))
+    ang = float(np.degrees(np.arccos(dot)))
+    # Convert: 180° (straight) → 0°, 0° (folded) → 180°
+    # But we want 0° for extension and ~150° for max flexion
+    # So: flexion = 180° - angle
+    flexion = 180.0 - ang
+    return max(0.0, min(150.0, flexion))
+
+
+def elbow_flexion_hinge(sh, el, wr, lat_epi, med_epi) -> float:
+    """
+    Elbow flexion using the anatomical hinge axis defined by the epicondyles.
+    Steps:
+      - Define hinge axis a = norm(LAT_EPI - MED_EPI) (lateral, ML axis)
+      - Project upper-arm (shoulder→elbow) and forearm (wrist→elbow) onto the
+        plane orthogonal to a
+      - Compute the angle between the projected vectors
+      - Convert to flexion: 180° - angle (0°=extension, 150°=max flexion)
+    Returns NaN if inputs are insufficient.
+    """
+    a = lat_epi - med_epi
+    na = np.linalg.norm(a)
+    if na < 1e-6:
+        return float('nan')
+    a = a / na
+
+    ua = el - sh  # shoulder → elbow
+    fa = el - wr  # wrist → elbow
+    nua = np.linalg.norm(ua)
+    nfa = np.linalg.norm(fa)
+    if nua < 1e-6 or nfa < 1e-6:
+        return float('nan')
+
+    # Project onto plane orthogonal to hinge axis
+    ua_p = ua - np.dot(ua, a) * a
+    fa_p = fa - np.dot(fa, a) * a
+
+    nua_p = np.linalg.norm(ua_p)
+    nfa_p = np.linalg.norm(fa_p)
+    if nua_p < 1e-6 or nfa_p < 1e-6:
+        return float('nan')
+
+    ua_p /= nua_p
+    fa_p /= nfa_p
+
+    dot = float(np.clip(np.dot(ua_p, fa_p), -1.0, 1.0))
+    ang = float(np.degrees(np.arccos(dot)))
+    flexion = 180.0 - ang
+    return max(0.0, min(150.0, flexion))
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  VIRTUAL ANATOMICAL LANDMARKS
@@ -257,6 +328,34 @@ def compute_virtual_landmarks(lm) -> Dict[str, np.ndarray]:
     if 'MID_SHOULDER' in vl and 'MID_HIP' in vl:
         vl['SPINE_MID'] = (vl['MID_SHOULDER'] + vl['MID_HIP']) / 2  # T8 proxy
 
+    # ── Shoulder / Acromion ──────────────────────────────────────────────────
+    # Acromion is the lateral-superior point of the shoulder (scapular process).
+    # Estimate: offset from MediaPipe shoulder point along the trunk lateral axis
+    # and slightly superior/anterior.
+    for side in ('L', 'R'):
+        si = PL.L_SHOULDER if side == 'L' else PL.R_SHOULDER
+        if _vis(lm, si):
+            sh_pt = _pt(lm, si)
+            # Estimate acromion offset: ~0.08 * shoulder-to-hip distance laterally
+            # and ~0.05 superiorly
+            if 'MID_HIP' in vl and 'MID_SHOULDER' in vl:
+                sh_hip_dist = float(np.linalg.norm(vl['MID_SHOULDER'] - vl['MID_HIP']))
+                # Lateral direction (right for R, left for L)
+                e_lat = _norm(vl.get('HJC_R', np.array([1.,0.,0.])) -
+                              vl.get('HJC_L', np.array([-1.,0.,0.])))
+                if side == 'L': e_lat = -e_lat
+                # Superior direction (approximate)
+                e_sup = np.array([0., 1., 0.])
+                # Anterior direction (approximate)
+                e_ant = np.array([0., 0., 1.])
+                acromion_offset = (0.08 * sh_hip_dist * e_lat + 
+                                   0.05 * sh_hip_dist * e_sup + 
+                                   0.03 * sh_hip_dist * e_ant)
+                vl[f'ACROMION_{side}'] = sh_pt + acromion_offset
+            else:
+                # Fallback: use shoulder point directly
+                vl[f'ACROMION_{side}'] = sh_pt
+
     # ── Elbow Joint Centre ───────────────────────────────────────────────────
     for side in ('L', 'R'):
         ei = PL.L_ELBOW if side == 'L' else PL.R_ELBOW
@@ -271,11 +370,18 @@ def compute_virtual_landmarks(lm) -> Dict[str, np.ndarray]:
             epi_w = 0.05 * ua_l
             vl[f'EJC_{side}'] = elbow_pt   # EJC ≈ MediaPipe elbow
             # Lateral / medial epicondyle estimates
+            # Use robust lateral axis from hip/shoulder if available
             e_lat = _norm(vl.get('HJC_R', np.array([1.,0.,0.])) -
                           vl.get('HJC_L', np.array([-1.,0.,0.])))
             if side == 'L': e_lat = -e_lat
-            vl[f'LAT_EPI_{side}'] = elbow_pt + epi_w * e_lat
-            vl[f'MED_EPI_{side}'] = elbow_pt - epi_w * e_lat
+            
+            # Improve robustness: weight epicondyle offset by upper-arm visibility
+            # and add small anterior offset for anatomical accuracy
+            vis_weight = 1.0  # Could be refined with confidence scores
+            e_ant = _norm(wrist_pt - sh_pt) if np.linalg.norm(wrist_pt - sh_pt) > 1e-6 else np.array([0., 0., 1.])
+            
+            vl[f'LAT_EPI_{side}'] = elbow_pt + vis_weight * epi_w * e_lat + 0.01 * ua_l * e_ant
+            vl[f'MED_EPI_{side}'] = elbow_pt - vis_weight * epi_w * e_lat + 0.01 * ua_l * e_ant
 
     # ── Wrist Joint Centre ───────────────────────────────────────────────────
     for side in ('L', 'R'):
@@ -315,16 +421,30 @@ def _pelvis_cs(lm, vl: dict) -> Optional[np.ndarray]:
 def _trunk_cs(lm, vl: dict) -> Optional[np.ndarray]:
     """
     Thorax CS — origin at MID_SHOULDER.
-    e_x: R_SHOULDER → L_SHOULDER
-    e_y: MID_HIP → MID_SHOULDER (GS ⊥ e_x)
+    Robust fallback when hips are not reliable/visible.
+    e_x: R_SHOULDER → L_SHOULDER (subject's RIGHT)
+    e_y: MID_HIP → MID_SHOULDER if hips visible,
+        else MID_SHOULDER → NOSE (approx upward),
+        else global up [0,1,0]; then GS ⊥ e_x
+    e_z: cross(e_x, e_y)
     """
-    if not _vis(lm, PL.L_HIP, PL.R_HIP,
-                 PL.L_SHOULDER, PL.R_SHOULDER): return None
-    mid_hip = vl.get('MID_HIP', (_pt(lm, PL.L_HIP) + _pt(lm, PL.R_HIP)) / 2)
-    L_sh = _pt(lm, PL.L_SHOULDER); R_sh = _pt(lm, PL.R_SHOULDER)
+    if not _vis(lm, PL.L_SHOULDER, PL.R_SHOULDER):
+        return None
+    L_sh = _pt(lm, PL.L_SHOULDER)
+    R_sh = _pt(lm, PL.R_SHOULDER)
     mid_sh = (L_sh + R_sh) / 2
     e_x = _norm(R_sh - L_sh)
-    e_y = _gs(_norm(mid_sh - mid_hip), e_x)
+
+    if _vis(lm, PL.L_HIP, PL.R_HIP):
+        mid_hip = vl.get('MID_HIP', (_pt(lm, PL.L_HIP) + _pt(lm, PL.R_HIP)) / 2)
+        e_y_ref = _norm(mid_sh - mid_hip)
+    elif _vis(lm, PL.NOSE):
+        nose = _pt(lm, PL.NOSE)
+        e_y_ref = _norm(nose - mid_sh)
+    else:
+        e_y_ref = np.array([0.0, 1.0, 0.0])
+
+    e_y = _gs(e_y_ref, e_x)
     e_z = _norm(np.cross(e_x, e_y))
     e_x = _norm(np.cross(e_y, e_z))
     return np.column_stack([e_x, e_y, e_z])
@@ -467,6 +587,31 @@ def _ankle_angles(R_shank: np.ndarray, R_foot: np.ndarray, side: str) -> tuple:
     return round(dorsi, 1), round(ever, 1)
 
 
+def elbow_flexion_from_frames(R_upper: np.ndarray, R_fore: np.ndarray) -> float:
+    """
+    Elbow flexion-extension in degrees using segment local frames.
+    Uses the angle between proximal e_y and distal e_y projected onto the
+    sagittal plane of the proximal (span of e_y and e_z), which isolates
+    rotation around the lateral axis e_x of the proximal.
+    Returns value clamped to [0, 180].
+    """
+    ex_p = R_upper[:, 0]
+    ey_p = R_upper[:, 1]
+    ez_p = R_upper[:, 2]
+    ey_d = R_fore[:, 1]
+
+    # Project distal long axis onto proximal sagittal plane (remove lateral comp.)
+    v = ey_d - np.dot(ey_d, ex_p) * ex_p
+    nv = np.linalg.norm(v)
+    if nv < 1e-8:
+        return float('nan')
+    v = v / nv
+
+    dot = float(np.clip(np.dot(ey_p, v), -1.0, 1.0))
+    ang = float(np.degrees(np.arccos(dot)))
+    return round(max(0.0, min(150.0, ang)), 1)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  HAND / FINGER ANGLES
 # ══════════════════════════════════════════════════════════════════════════════
@@ -558,14 +703,25 @@ def compute_all_angles(pose_landmarks,
     R_pelvis = _pelvis_cs(lm, vl)
     R_trunk  = _trunk_cs(lm, vl)
     pelvis_ex = R_pelvis[:, 0] if R_pelvis is not None else _default_ex
-    trunk_ex  = R_trunk[:, 0]  if R_trunk  is not None else _default_ex
+    # Prefer shoulder-derived lateral axis if trunk CS is unavailable
+    if R_trunk is not None:
+        trunk_ex = R_trunk[:, 0]
+    else:
+        if _vis(lm, PL.L_SHOULDER, PL.R_SHOULDER):
+            trunk_ex = _norm(_pt(lm, PL.R_SHOULDER) - _pt(lm, PL.L_SHOULDER))
+        else:
+            trunk_ex = _default_ex
 
-    # ── Step 3a: pelvis absolute orientation ──────────────────────────────────
+    # ── Step 3a: pelvis absolute orientation ───────���──────────────────────────
     if R_pelvis is not None:
         fwd, lat, ax = _segment_orientation(R_pelvis)
         angles['pelvis_forward_lean'] = fwd
         angles['pelvis_lateral_lean'] = lat
         angles['pelvis_rotation']     = ax
+    else:
+        angles['pelvis_forward_lean'] = float('nan')
+        angles['pelvis_lateral_lean'] = float('nan')
+        angles['pelvis_rotation']     = float('nan')
 
     # ── Step 3b: trunk absolute orientation ───────────────────────────────────
     if R_trunk is not None:
@@ -573,6 +729,10 @@ def compute_all_angles(pose_landmarks,
         angles['trunk_forward_lean'] = fwd
         angles['trunk_lateral_lean'] = lat
         angles['trunk_rotation']     = ax
+    else:
+        angles['trunk_forward_lean'] = float('nan')
+        angles['trunk_lateral_lean'] = float('nan')
+        angles['trunk_rotation']     = float('nan')
 
     # ── Step 3c: lumbar (trunk relative to pelvis) ────────────────────────────
     if R_pelvis is not None and R_trunk is not None:
@@ -580,6 +740,10 @@ def compute_all_angles(pose_landmarks,
         angles['lumbar_flexion']  = flex
         angles['lumbar_lateral']  = abd
         angles['lumbar_rotation'] = rot
+    else:
+        angles['lumbar_flexion']  = float('nan')
+        angles['lumbar_lateral']  = float('nan')
+        angles['lumbar_rotation'] = float('nan')
 
     # ── Step 3d: lower limb ───────────────────────────────────────────────────
     for side in ('left', 'right'):
@@ -595,6 +759,10 @@ def compute_all_angles(pose_landmarks,
             angles[f'{side}_hip_flexion']   = flex
             angles[f'{side}_hip_abduction'] = abd
             angles[f'{side}_hip_rotation']  = rot
+        else:
+            angles[f'{side}_hip_flexion']   = float('nan')
+            angles[f'{side}_hip_abduction'] = float('nan')
+            angles[f'{side}_hip_rotation']  = float('nan')
 
         R_shank = _shank_cs(lm, side, vl,
                              R_thigh if R_thigh is not None else np.eye(3))
@@ -607,33 +775,101 @@ def compute_all_angles(pose_landmarks,
             )
             angles[f'{side}_knee_flexion'] = flex
             angles[f'{side}_knee_valgus']  = abd
+        else:
+            angles[f'{side}_knee_flexion'] = float('nan')
+            angles[f'{side}_knee_valgus']  = float('nan')
 
         R_foot = _foot_cs(lm, side, vl)
         if R_shank is not None and R_foot is not None:
             dorsi, ever = _ankle_angles(R_shank, R_foot, side)
             angles[f'{side}_ankle_dorsiflexion'] = dorsi
             angles[f'{side}_ankle_eversion']     = ever
+        else:
+            angles[f'{side}_ankle_dorsiflexion'] = float('nan')
+            angles[f'{side}_ankle_eversion']     = float('nan')
 
     # ── Step 3e: upper limb ───────────────────────────────────────────────────
     for side in ('left', 'right'):
-        R_ua = _upper_arm_cs(lm, side, vl, trunk_ex)
+        # Shoulder angles - simple vector-based calculation
+        # Get shoulder, elbow, and hip for trunk reference
+        sh_idx = PL.L_SHOULDER if side == 'left' else PL.R_SHOULDER
+        el_idx = PL.L_ELBOW if side == 'left' else PL.R_ELBOW
+        wr_idx = PL.L_WRIST if side == 'left' else PL.R_WRIST
+        hip_idx = PL.L_HIP if side == 'left' else PL.R_HIP
+        opp_sh_idx = PL.R_SHOULDER if side == 'left' else PL.L_SHOULDER
+        
+        if _vis(lm, sh_idx, el_idx, wr_idx, hip_idx, opp_sh_idx):
+            sh = _pt(lm, sh_idx)
+            el = _pt(lm, el_idx)
+            wr = _pt(lm, wr_idx)
+            hip = _pt(lm, hip_idx)
+            opp_sh = _pt(lm, opp_sh_idx)
+            
+            # Upper arm vector (shoulder → elbow)
+            ua = el - sh
+            
+            # Trunk reference: line from opposite shoulder to this shoulder
+            trunk_axis = sh - opp_sh
+            
+            # Calculate flexion: angle between upper arm and trunk forward axis
+            # First, project onto sagittal plane (perpendicular to trunk lateral axis)
+            trunk_lat = _norm(trunk_axis)  # lateral axis
+            trunk_post = _norm(np.cross(trunk_lat, np.array([0., 1., 0.])))  # posterior direction
+            trunk_up = _norm(np.cross(trunk_lat, trunk_post))  # superior direction
+            
+            # Project upper arm onto trunk's sagittal plane
+            ua_sag = ua - np.dot(ua, trunk_lat) * trunk_lat
+            n_ua_sag = np.linalg.norm(ua_sag)
+            if n_ua_sag > 1e-6:
+                ua_sag = ua_sag / n_ua_sag
+                
+                # Flexion: angle with trunk upward axis (negative = extension)
+                flex_dot = float(np.clip(np.dot(ua_sag, trunk_up), -1.0, 1.0))
+                flex = float(np.degrees(np.arccos(flex_dot)))
+                # Adjust sign: arm down = 0, arm up = 180
+                flex = 180.0 - flex
+                angles[f'{side}_shoulder_flexion'] = round(max(-180.0, min(180.0, flex)), 1)
+            else:
+                angles[f'{side}_shoulder_flexion'] = float('nan')
+            
+            # Abduction: angle from trunk lateral axis
+            abd_dot = float(np.clip(np.dot(ua_sag, trunk_lat), -1.0, 1.0)) if n_ua_sag > 1e-6 else 0
+            abd = float(np.degrees(np.arccos(abs(abd_dot))))
+            # Sign: positive = away from midline
+            if side == 'left':
+                angles[f'{side}_shoulder_abduction'] = round(abd if np.dot(ua, trunk_lat) > 0 else -abd, 1)
+            else:
+                angles[f'{side}_shoulder_abduction'] = round(abd if np.dot(ua, trunk_lat) < 0 else -abd, 1)
+            
+            # Rotation: using elbow-wrist vector
+            fa = wr - el
+            fa_lat = fa - np.dot(fa, trunk_up) * trunk_up
+            n_fa_lat = np.linalg.norm(fa_lat)
+            if n_fa_lat > 1e-6:
+                fa_lat = fa_lat / n_fa_lat
+                rot_dot = float(np.clip(np.dot(fa_lat, trunk_lat), -1.0, 1.0))
+                rot = float(np.degrees(np.arccos(rot_dot)))
+                # Sign based on which way forearm points
+                angles[f'{side}_shoulder_rotation'] = round(rot - 90.0, 1)
+            else:
+                angles[f'{side}_shoulder_rotation'] = float('nan')
+        else:
+            angles[f'{side}_shoulder_flexion'] = float('nan')
+            angles[f'{side}_shoulder_abduction'] = float('nan')
+            angles[f'{side}_shoulder_rotation'] = float('nan')
 
-        if R_trunk is not None and R_ua is not None:
-            flex, abd, rot = _flex_abd_rot(
-                R_trunk, R_ua,
-                flex_sign =  1.0,
-                abd_sign  =  1.0 if side == 'right' else -1.0,
-                rot_sign  = -1.0 if side == 'right' else  1.0,
-            )
-            angles[f'{side}_shoulder_flexion']   = flex
-            angles[f'{side}_shoulder_abduction'] = abd
-            angles[f'{side}_shoulder_rotation']  = rot
+        # Elbow flexion - simple angle between upper arm and forearm vectors
+        if _vis(lm, PL.L_SHOULDER if side == 'left' else PL.R_SHOULDER,
+                PL.L_ELBOW if side == 'left' else PL.R_ELBOW,
+                PL.L_WRIST if side == 'left' else PL.R_WRIST):
+            sh = _pt(lm, PL.L_SHOULDER if side == 'left' else PL.R_SHOULDER)
+            el = _pt(lm, PL.L_ELBOW if side == 'left' else PL.R_ELBOW)
+            wr = _pt(lm, PL.L_WRIST if side == 'left' else PL.R_WRIST)
+            angles[f'{side}_elbow_flexion'] = elbow_angle(sh, el, wr)
+        else:
+            angles[f'{side}_elbow_flexion'] = float('nan')
 
-        R_fa = _forearm_cs(lm, side, vl,
-                            R_ua if R_ua is not None else np.eye(3))
-        if R_ua is not None and R_fa is not None:
-            flex, _, _ = _flex_abd_rot(R_ua, R_fa, flex_sign=1.0)
-            angles[f'{side}_elbow_flexion'] = flex
+
 
     # ── Step 4: hand/finger angles ────────────────────────────────────────────
     angles.update(compute_hand_angles(left_hand_landmarks,  'left'))

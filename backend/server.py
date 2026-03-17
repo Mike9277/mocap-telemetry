@@ -41,6 +41,19 @@ last_frames = {}
 sensor_status = {}
 
 
+def _convert_nan_to_none(obj):
+    """Recursively convert NaN values to None for JSON serialization"""
+    import math
+    if isinstance(obj, dict):
+        return {k: _convert_nan_to_none(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_convert_nan_to_none(v) for v in obj]
+    elif isinstance(obj, float) and math.isnan(obj):
+        return None
+    else:
+        return obj
+
+
 async def handle_sensor_connection(ws, path):
     """Handle sensor connection"""
     sensor_id = None
@@ -50,10 +63,12 @@ async def handle_sensor_connection(ws, path):
         logger.info("✓ Sensor connected")
         connected_sensors.add(ws)
         
+        frame_count = 0
         async for message in ws:
             try:
                 frame = json.loads(message)
                 sensor_id = frame.get("sensor_id", "unknown")
+                frame_count += 1
                 
                 # Update status
                 sensor_status[sensor_id] = {
@@ -66,32 +81,40 @@ async def handle_sensor_connection(ws, path):
                 last_frames[sensor_id] = frame
                 
                 # Broadcast to dashboards
-                # If it contains keypoints, it's a pose detection sensor - send directly
-                if frame.get("keypoints"):
-                    broadcast_msg = json.dumps(frame, default=str)
-                else:
-                    # Otherwise it's traditional mocap - wrap in "mocap_frame" format
-                    broadcast_msg = json.dumps({
-                        "type": "mocap_frame",
-                        "data": frame
-                    }, default=str)
+                # Include full frame with video for dashboards (frontend displays video stream)
+                frame_to_send = dict(frame)
+
+                # Convert NaN to None for JSON serialization
+                frame_to_send = _convert_nan_to_none(frame_to_send)
+                broadcast_msg = json.dumps(frame_to_send, default=str)
                 
                 # Send to all dashboards
-                for dashboard in list(connected_dashboards):
-                    try:
-                        await dashboard.send(broadcast_msg)
-                    except Exception:
-                        connected_dashboards.discard(dashboard)
+                dashboards_count = len(connected_dashboards)
+                if dashboards_count > 0:
+                    # Log message structure on first frame
+                    if frame.get("frame_count", 0) == 1:
+                        msg_keys = list(frame_to_send.keys())
+                        logger.info(f"  Message structure: {msg_keys}")
+                    
+                    for dashboard in list(connected_dashboards):
+                        try:
+                            await dashboard.send(broadcast_msg)
+                        except Exception as e:
+                            logger.warning(f"Error sending to dashboard: {e}")
+                            connected_dashboards.discard(dashboard)
                 
                 if frame.get("frame_count", 0) % 30 == 0:
-                    head = frame.get("joints", {}).get("head", [0, 0, 0])
-                    logger.info(f"📊 {sensor_id} | Frame: {frame.get('frame_count')} | Head: {head}")
+                    has_kpts = "keypoints" in frame
+                    has_angles = "joint_angles" in frame
+                    logger.info(f"📊 {sensor_id} | Frame: {frame.get('frame_count')} | Dashboards: {dashboards_count} | Keypoints: {has_kpts} | Angles: {has_angles}")
             
-            except json.JSONDecodeError:
-                logger.error("✗ Invalid JSON")
+            except json.JSONDecodeError as e:
+                logger.error(f"✗ Invalid JSON: {e}")
+            except Exception as e:
+                logger.error(f"✗ Frame processing error: {e}")
     
     except websockets.exceptions.ConnectionClosed:
-        logger.warning(f"✗ Sensor disconnected")
+        logger.warning(f"✗ Sensor disconnected (received {frame_count} frames)")
         if sensor_id and sensor_id in sensor_status:
             sensor_status[sensor_id]["is_online"] = False
     
@@ -105,23 +128,30 @@ async def handle_sensor_connection(ws, path):
 async def handle_dashboard_connection(ws, path):
     """Handle dashboard connection"""
     try:
-        logger.info("📱 Dashboard connected")
+        logger.info(f"📱 Dashboard connected | Total dashboards: {len(connected_dashboards) + 1}")
         connected_dashboards.add(ws)
         
-        # Send the last known frames
+        # Send the last known frames (include video so dashboard shows image immediately)
+        sent_count = 0
         for sensor_id, frame in last_frames.items():
-            msg = json.dumps({
-                "type": "mocap_frame",
-                "data": frame
-            })
-            await ws.send(msg)
+            frame_to_send = _convert_nan_to_none(dict(frame))
+            msg = json.dumps(frame_to_send)
+            try:
+                await ws.send(msg)
+                sent_count += 1
+                logger.info(f"  Sent initial frame from {sensor_id}")
+            except Exception as e:
+                logger.warning(f"  Error sending initial frame: {e}")
+        
+        if sent_count == 0:
+            logger.warning(f"  No initial frames to send (no sensors connected yet)")
         
         # Keep connection open
         async for message in ws:
             pass
     
     except websockets.exceptions.ConnectionClosed:
-        logger.warning("📱 Dashboard disconnected")
+        logger.warning(f"📱 Dashboard disconnected | Remaining dashboards: {len(connected_dashboards) - 1}")
     
     except Exception as e:
         logger.error(f"✗ Dashboard error: {e}")
@@ -174,8 +204,28 @@ class HTTPRequestHandler(BaseHTTPRequestHandler):
                 "status": "ok",
                 "timestamp": int(datetime.now().timestamp() * 1000),
                 "sensors": sensor_status,
-                "connected_dashboards": len(connected_dashboards)
+                "connected_dashboards": len(connected_dashboards),
+                "connected_sensors": len(connected_sensors),
+                "last_frames_count": len(last_frames)
             })
+            self.wfile.write(response.encode())
+        
+        elif self.path == '/api/last-frame':
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            
+            # Return the last frame from the first sensor
+            if last_frames:
+                sensor_id = list(last_frames.keys())[0]
+                frame = last_frames[sensor_id]
+                # Remove video to avoid huge response
+                frame_to_send = {k: v for k, v in frame.items() if k != 'video'}
+                response = json.dumps(frame_to_send, default=str)
+            else:
+                response = json.dumps({"error": "No frames received yet"})
+            
             self.wfile.write(response.encode())
         
         else:

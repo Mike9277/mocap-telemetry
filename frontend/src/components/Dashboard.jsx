@@ -12,6 +12,7 @@ import { PoseVisualization }  from './PoseVisualization'
 import { KeypointXYTraces }   from './KeypointXYTraces'
 import { JointAnglePanel }    from './JointAnglePanel'
 import ClinicalAnglesView     from './ClinicalAnglesView'
+import { Pose3DViewer }       from './Pose3DViewer'
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -86,6 +87,16 @@ export function Dashboard() {
   const [activeTab,         setActiveTab]         = useState('clinical')
 
   const isPoseMode = !!(poseData && poseData.keypoints)
+
+  // Check if skeleton is visible (person detected with keypoints)
+  const isSkeletonVisible = isPoseMode && poseData?.has_person && poseData?.keypoints && Object.keys(poseData.keypoints).length > 0
+
+  // Handle start recording - only start if skeleton is visible
+  const handleStartRecording = () => {
+    if (isSkeletonVisible) {
+      setIsRecording(true)
+    }
+  }
 
   // ── Recording ─────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -198,12 +209,16 @@ export function Dashboard() {
         <h2 className="text-base font-bold mb-3">🎬 Recording Controls</h2>
         <div className="flex flex-wrap gap-3 items-center">
           <button
-            onClick={() => setIsRecording(v => !v)}
+            onClick={isRecording ? () => setIsRecording(false) : handleStartRecording}
+            disabled={!isRecording && !isSkeletonVisible}
             className={`px-5 py-2 rounded-lg font-bold text-sm transition ${
               isRecording
                 ? 'bg-red-600 hover:bg-red-700 text-white'
-                : 'bg-green-600 hover:bg-green-700 text-white'
+                : isSkeletonVisible
+                  ? 'bg-green-600 hover:bg-green-700 text-white'
+                  : 'bg-gray-600 text-gray-400 cursor-not-allowed'
             }`}
+            title={!isRecording && !isSkeletonVisible ? 'Start recording only when skeleton is visible' : ''}
           >
             {isRecording ? '⏸ Stop' : '🔴 Start Recording'}
           </button>
@@ -236,12 +251,16 @@ export function Dashboard() {
         {!isRecording && recordedFrames.length > 0 && (
           <p className="text-xs text-gray-400 mt-2">Stopped — {recordedFrames.length} frames ready for export</p>
         )}
+        {!isRecording && isPoseMode && !isSkeletonVisible && (
+          <p className="text-xs text-yellow-400 mt-2">⚠️ Waiting for skeleton to appear before recording can start</p>
+        )}
       </div>
+
 
       {/* ── POSE MODE ───────────────────────────────────────────────────── */}
       {isPoseMode && (
         <>
-          {/* Video + status */}
+          {/* Video + 3D Viewer */}
           <div className="bg-gray-800 rounded-lg border border-gray-700 p-4 mb-6">
             <h2 className="text-base font-bold mb-4">📊 Wholebody Pose</h2>
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
@@ -249,62 +268,32 @@ export function Dashboard() {
               <div className="border-2 border-green-500 rounded-lg overflow-hidden bg-black">
                 <PoseVisualization poseData={poseData} width={640} height={480} />
               </div>
-              {/* Info */}
-              <div className="flex flex-col gap-3">
-                <div className="bg-gray-900 rounded-lg border border-gray-700 p-3">
-                  <h3 className="text-sm font-semibold text-green-400 mb-2">Status</h3>
-                  <div className="space-y-1 text-sm">
-                    <div className="flex justify-between">
-                      <span className="text-gray-400">Frame</span>
-                      <span className="text-blue-400 font-mono">{poseData?.frame_count ?? 0}</span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-gray-400">Body keypoints</span>
-                      <span className="text-blue-400 font-mono">
-                        {poseData?.keypoints ? Object.keys(poseData.keypoints).length : 0}/33
-                      </span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-gray-400">Left hand</span>
-                      <span className={poseData?.left_hand_keypoints && Object.keys(poseData.left_hand_keypoints).length > 0 ? 'text-green-400' : 'text-gray-600'}>
-                        {poseData?.left_hand_keypoints && Object.keys(poseData.left_hand_keypoints).length > 0 ? '✓ 21 pts' : '—'}
-                      </span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-gray-400">Right hand</span>
-                      <span className={poseData?.right_hand_keypoints && Object.keys(poseData.right_hand_keypoints).length > 0 ? 'text-green-400' : 'text-gray-600'}>
-                        {poseData?.right_hand_keypoints && Object.keys(poseData.right_hand_keypoints).length > 0 ? '✓ 21 pts' : '—'}
-                      </span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-gray-400">Angles computed</span>
-                      <span className="text-purple-400 font-mono">{angleCount}</span>
-                    </div>
-                  </div>
+              {/* 3D Viewer */}
+              <div className="border-2 border-blue-500 rounded-lg overflow-hidden">
+                <Pose3DViewer poseData={poseData} width={400} height={320} />
+              </div>
+            </div>
+            {/* Status row */}
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mt-4">
+              <div className="bg-gray-900 rounded-lg border border-gray-700 p-3">
+                <div className="text-xs text-gray-400">Frame</div>
+                <div className="text-lg text-blue-400 font-mono">{poseData?.frame_count ?? 0}</div>
+              </div>
+              <div className="bg-gray-900 rounded-lg border border-gray-700 p-3">
+                <div className="text-xs text-gray-400">Body Keypoints</div>
+                <div className="text-lg text-blue-400 font-mono">
+                  {poseData?.keypoints ? Object.keys(poseData.keypoints).length : 0}/33
                 </div>
-
-                {/* Keypoint selector */}
-                <div className="bg-gray-900 rounded-lg border border-gray-700 p-3">
-                  <h3 className="text-sm font-semibold text-green-400 mb-2">
-                    Keypoints for trajectories
-                    <span className="text-gray-500 font-normal ml-2">({selectedKeypoints.length} selected)</span>
-                  </h3>
-                  <div className="flex flex-wrap gap-1.5 max-h-28 overflow-y-auto">
-                    {KEYPOINT_OPTIONS.map(kpt => (
-                      <button
-                        key={kpt}
-                        onClick={() => toggleKpt(kpt)}
-                        className={`px-2 py-0.5 rounded text-xs font-medium transition ${
-                          selectedKeypoints.includes(kpt)
-                            ? 'bg-green-600 text-white'
-                            : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
-                        }`}
-                      >
-                        {kpt}
-                      </button>
-                    ))}
-                  </div>
+              </div>
+              <div className="bg-gray-900 rounded-lg border border-gray-700 p-3">
+                <div className="text-xs text-gray-400">3D Keypoints</div>
+                <div className={`text-lg font-mono ${poseData?.keypoints_3d && Object.keys(poseData.keypoints_3d).length > 0 ? 'text-green-400' : 'text-gray-600'}`}>
+                  {poseData?.keypoints_3d ? Object.keys(poseData.keypoints_3d).length : 0}/33
                 </div>
+              </div>
+              <div className="bg-gray-900 rounded-lg border border-gray-700 p-3">
+                <div className="text-xs text-gray-400">Angles</div>
+                <div className="text-lg text-purple-400 font-mono">{angleCount}</div>
               </div>
             </div>
           </div>

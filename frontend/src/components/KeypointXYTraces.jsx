@@ -12,6 +12,16 @@ import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, Responsi
 ######################
 */
 
+/**
+ * Component for displaying 2D keypoint traces in X-Y plane
+ * Visualizes movement patterns in 2D space
+ *
+ * @param {Object} props - Component props
+ * @param {Array} props.frames - Array of frames with keypoints
+ * @param {Array} props.selectedKeypoints - Array of selected keypoints to display
+ *
+ * @returns {React.Element} - A React element containing the 2D keypoint trace chart
+ */
 export function KeypointXYTraces({ frames, selectedKeypoints = ["nose", "left_wrist", "right_wrist"] }) {
   const data = useMemo(() => {
     if (!frames || frames.length === 0) return []

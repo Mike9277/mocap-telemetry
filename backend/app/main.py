@@ -46,7 +46,8 @@ app.add_middleware(
 )
 
 # Globali
-connected_clients: Set[WebSocket] = set()
+sensor_clients: Set[WebSocket] = set()      # Sensori che inviano dati
+dashboard_clients: Set[WebSocket] = set()   # Dashboard che ricevono dati
 processor = MotionProcessor()
 data_store = DataStore()
 sensor_status: Dict[str, SensorStatus] = {}
@@ -70,7 +71,8 @@ async def health():
     return {
         "status": "ok",
         "timestamp": datetime.now().isoformat(),
-        "connected_clients": len(connected_clients),
+        "connected_sensors": len(sensor_clients),
+        "connected_dashboards": len(dashboard_clients),
         "sensors": sensor_status
     }
 
@@ -99,10 +101,11 @@ async def get_history(joint: str = "head", limit: int = 100):
 async def websocket_sensor_endpoint(websocket: WebSocket):
     """WebSocket to receive data from sensors"""
     await websocket.accept()
-    connected_clients.add(websocket)
+    sensor_clients.add(websocket)
     
-    logger.info(f"✓ Sensor connected | Total clients: {len(connected_clients)}")
+    logger.info(f"✓ Sensor connected | Total sensors: {len(sensor_clients)}")
     
+    frame = None
     try:
         while True:
             # Receive frame from sensor
@@ -126,19 +129,19 @@ async def websocket_sensor_endpoint(websocket: WebSocket):
             # Save to database
             await data_store.save_frame(processed_frame)
             
-            # Broadcast to all connected clients (frontend)
-            await broadcast_to_clients(processed_frame)
+            # Broadcast to all connected dashboards
+            await broadcast_to_dashboards(processed_frame)
             
             # Log (every 30 frames = 1 second at 30 Hz)
             if sensor_status[frame.sensor_id].frame_count % 30 == 0:
                 logger.info(
                     f"📊 {frame.sensor_id} | Frame: {sensor_status[frame.sensor_id].frame_count} | "
-                    f"Head: {frame.joints['head']}"
+                    f"Dashboards: {len(dashboard_clients)}"
                 )
     
     except WebSocketDisconnect:
-        connected_clients.discard(websocket)
-        logger.warning(f"✗ Sensor disconnected | Total clients: {len(connected_clients)}")
+        sensor_clients.discard(websocket)
+        logger.warning(f"✗ Sensor disconnected | Total sensors: {len(sensor_clients)}")
         if frame and frame.sensor_id in sensor_status:
             sensor_status[frame.sensor_id].is_online = False
     
@@ -154,9 +157,9 @@ async def websocket_sensor_endpoint(websocket: WebSocket):
 async def websocket_dashboard_endpoint(websocket: WebSocket):
     """WebSocket to send real-time data to frontend"""
     await websocket.accept()
-    connected_clients.add(websocket)
+    dashboard_clients.add(websocket)
     
-    logger.info(f"📱 Dashboard connected | Total clients: {len(connected_clients)}")
+    logger.info(f"📱 Dashboard connected | Total dashboards: {len(dashboard_clients)}")
     
     try:
         while True:
@@ -164,34 +167,35 @@ async def websocket_dashboard_endpoint(websocket: WebSocket):
             await asyncio.sleep(1)
     
     except WebSocketDisconnect:
-        connected_clients.discard(websocket)
-        logger.info(f"📱 Dashboard disconnected | Total clients: {len(connected_clients)}")
+        dashboard_clients.discard(websocket)
+        logger.info(f"📱 Dashboard disconnected | Total dashboards: {len(dashboard_clients)}")
 
 
-async def broadcast_to_clients(frame: Dict):
-    """Send the frame to all connected clients (frontend)"""
-    if not connected_clients:
+async def broadcast_to_dashboards(frame: Dict):
+    """Send the frame to all connected dashboards"""
+    if not dashboard_clients:
         return
     
-    message = json.dumps({
-        "type": "mocap_frame",
-        "data": frame.dict() if hasattr(frame, 'dict') else frame
-    })
+    # Serialize frame data
+    if hasattr(frame, 'dict'):
+        frame_data = frame.dict()
+    else:
+        frame_data = frame
     
-    # Send to all clients (especially dashboards)
+    message = json.dumps(frame_data)
+    
+    # Send to all dashboards
     disconnected = set()
-    for client in connected_clients:
+    for client in dashboard_clients:
         try:
-            # Send only to dashboards, not sensors
-            if client.client:
-                await client.send_text(message)
+            await client.send_text(message)
         except Exception as e:
             disconnected.add(client)
-            logger.warning(f"Error sending broadcast: {e}")
+            logger.warning(f"Error sending to dashboard: {e}")
     
     # Remove disconnected clients
     for client in disconnected:
-        connected_clients.discard(client)
+        dashboard_clients.discard(client)
 
 
 if __name__ == "__main__":
