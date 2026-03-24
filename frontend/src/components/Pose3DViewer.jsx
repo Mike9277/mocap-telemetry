@@ -1,383 +1,277 @@
 /**
- * Pose3DViewer.jsx
- * 3D Head visualization with clear left/right orientation
- * 
- * In webcam (mirrored): 
- * - Person's RIGHT eye appears on LEFT side of screen
- * - Person's LEFT eye appears on RIGHT side of screen
- * 
- * Coordinate system:
- * - X: toward viewer (nose direction)
- * - Y: person's right side (screen left = person's right = right eye)
- * - Z: up
+ * Pose3DViewer.jsx - Simple 3D Stick Figure
  */
 
-import React, { useState, useEffect, useRef } from 'react'
+import React, { useEffect, useRef } from 'react'
 
-function lerp(a, b, t) {
-  return a + (b - a) * t
+// MediaPipe skeleton connections - left (blue), right (red)
+const BONES = [
+  // Torso - left to right (mixed)
+  [11, 12], // shoulders
+  [11, 23], // left shoulder to left hip
+  [12, 24], // right shoulder to right hip
+  [23, 24], // hips
+  // Left arm
+  [11, 13], [13, 15], [15, 17], [15, 19], [15, 21], [17, 19],
+  // Right arm  
+  [12, 14], [14, 16], [16, 18], [16, 20], [16, 22], [18, 20],
+  // Left leg
+  [23, 25], [25, 27], [27, 29], [27, 31], [29, 31],
+  // Right leg
+  [24, 26], [26, 28], [28, 30], [28, 32], [30, 32],
+]
+
+// MediaPipe landmark names in order (0-32)
+const LANDMARKS = [
+  "nose",                    // 0
+  "left_eye_inner",         // 1
+  "left_eye",               // 2
+  "left_eye_outer",         // 3
+  "right_eye_inner",        // 4
+  "right_eye",              // 5
+  "right_eye_outer",        // 6
+  "left_ear",               // 7
+  "right_ear",              // 8
+  "mouth_left",             // 9
+  "mouth_right",            // 10
+  "left_shoulder",          // 11
+  "right_shoulder",         // 12
+  "left_elbow",             // 13
+  "right_elbow",            // 14
+  "left_wrist",             // 15
+  "right_wrist",            // 16
+  "left_pinky",             // 17
+  "right_pinky",            // 18
+  "left_index",             // 19
+  "right_index",            // 20
+  "left_thumb",             // 21
+  "right_thumb",            // 22
+  "left_hip",              // 23
+  "right_hip",             // 24
+  "left_knee",             // 25
+  "right_knee",            // 26
+  "left_ankle",           // 27
+  "right_ankle",           // 28
+  "left_heel",             // 29
+  "right_heel",            // 30
+  "left_foot_index",       // 31
+  "right_foot_index",      // 32
+]
+
+// Check if landmark is from the left side
+function isLeftSide(idx) {
+  // Face: 1,2,3,7,9 are left (odd except 7)
+  // Body: 11,13,15,17,19,21,23,25,27,29,31 are left
+  const leftIndices = [1, 2, 3, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31]
+  return leftIndices.includes(idx)
 }
 
-export function Pose3DViewer({ poseData, width = 400, height = 400 }) {
+export function Pose3DViewer({ poseData, width = 400, height = 320 }) {
   const canvasRef = useRef(null)
   
-  const [rotation, setRotation] = useState({ x: 0, y: 0 })
-  const [pan, setPan] = useState({ x: 0, y: 0 })
-  const [zoom, setZoom] = useState(280)
+  // View state
+  const view = useRef({ rotX: 0, rotY: 0, zoom: 1 })
+  const dragging = useRef(false)
+  const lastPos = useRef({ x: 0, y: 0 })
   
-  const [isDragging, setIsDragging] = useState(false)
-  const [isPanning, setIsPanning] = useState(false)
-  const [lastPos, setLastPos] = useState({ x: 0, y: 0 })
-  const [autoRotate, setAutoRotate] = useState(false)
+  // Mouse handlers
+  const handleMouseDown = function(e) {
+    dragging.current = true
+    lastPos.current = { x: e.clientX, y: e.clientY }
+  }
   
-  const autoRotateRef = useRef(0)
-  const smoothedRef = useRef({})
-
-  const getKeypoints = () => {
-    if (!poseData) return null
-    return poseData.keypoints || poseData.keypoints_3d || null
+  const handleMouseMove = function(e) {
+    if (!dragging.current) return
+    const dx = e.clientX - lastPos.current.x
+    const dy = e.clientY - lastPos.current.y
+    view.current.rotY = view.current.rotY + dx * 0.01
+    view.current.rotX = Math.max(-0.5, Math.min(0.5, view.current.rotX + dy * 0.01))
+    lastPos.current = { x: e.clientX, y: e.clientY }
   }
-
-  // In webcam view (mirrored):
-  // - right_eye is on LEFT side of screen (person's right eye)
-  // - left_eye is on RIGHT side of screen (person's left eye)
-  const getFaceCenter = (kp) => {
-    const leftEye = kp?.left_eye   // Person's left = screen right
-    const rightEye = kp?.right_eye  // Person's right = screen left
-    
-    if (leftEye && rightEye && 
-        leftEye.confidence > 0.2 && rightEye.confidence > 0.2) {
-      return {
-        x: (leftEye.x + rightEye.x) / 2,
-        y: (leftEye.y + rightEye.y) / 2,
-        z: ((leftEye.z || 0) + (rightEye.z || 0)) / 2,
-      }
-    }
-    return null
+  
+  const handleMouseUp = function() { 
+    dragging.current = false 
   }
-
-  // Transform: align to webcam view
-  // X = toward viewer, Y = person's right, Z = up
-  const transformCoords = (kp) => {
-    const faceCenter = getFaceCenter(kp)
-    if (!faceCenter) return kp
-    
-    const transformed = {}
-    
-    for (const [name, pt] of Object.entries(kp)) {
-      if (!pt || pt.confidence < 0.2) continue
-      
-      const relX = (pt.x || 0) - faceCenter.x
-      const relY = (pt.y || 0) - faceCenter.y
-      const relZ = (pt.z || 0) - (faceCenter.z || 0)
-      
-      // MediaPipe: x=right, y=down, z=depth
-      // Webcam mirrored: 
-      // - Screen right = person's LEFT = left_eye
-      // - Screen left = person's RIGHT = right_eye
-      // 
-      // Transform: X=nose(depth), Y=horizontal, Z=vertical
-      transformed[name] = {
-        x: relZ,        // X = depth toward viewer
-        y: -relX,       // Y = person's right (screen left = right eye)
-        z: -relY,       // Z = up
-        confidence: pt.confidence,
-      }
-    }
-    
-    return transformed
+  
+  const handleWheel = function(e) {
+    e.preventDefault()
+    const delta = e.deltaY > 0 ? 0.9 : 1.1
+    view.current.zoom = Math.max(0.3, Math.min(3, view.current.zoom * delta))
   }
-
-  const smoothKeypoints = (kp, alpha = 0.4) => {
-    const smoothed = {}
-    
-    for (const [name, pt] of Object.entries(kp)) {
-      const prev = smoothedRef.current[name]
-      
-      if (!prev) {
-        smoothed[name] = { ...pt }
-      } else {
-        smoothed[name] = {
-          x: lerp(prev.x, pt.x, alpha),
-          y: lerp(prev.y, pt.y, alpha),
-          z: lerp(prev.z, pt.z, alpha),
-          confidence: pt.confidence,
-        }
-      }
-    }
-    
-    smoothedRef.current = smoothed
-    return smoothed
+  
+  const reset = function() {
+    view.current = { rotX: 0, rotY: 0, zoom: 1 }
   }
-
-  const project3D = (x, y, z, rotX, rotY, scale, panX, panY) => {
-    let x1 = x * Math.cos(rotY) - z * Math.sin(rotY)
-    let z1 = x * Math.sin(rotY) + z * Math.cos(rotY)
-    
-    let y2 = y * Math.cos(rotX) - z1 * Math.sin(rotX)
-    let z2 = y * Math.sin(rotX) + z1 * Math.cos(rotX)
-    
-    const displayScale = scale * Math.min(width, height) * 0.7
-    
-    return {
-      x: width / 2 + x1 * displayScale + panX,
-      y: height / 2 + y2 * displayScale + panY,
-      z: z2,
-    }
-  }
-
-  // Draw oval head
-  const drawHeadOval = (ctx, centerX, centerY, w, h) => {
-    ctx.beginPath()
-    ctx.ellipse(centerX, centerY, w, h, 0, 0, 2 * Math.PI)
-    ctx.strokeStyle = 'rgba(80, 140, 220, 0.7)'
-    ctx.lineWidth = 3
-    ctx.stroke()
-    ctx.fillStyle = 'rgba(40, 70, 110, 0.2)'
-    ctx.fill()
-  }
-
+  
   useEffect(() => {
     const canvas = canvasRef.current
     if (!canvas) return
-
+    
     const ctx = canvas.getContext('2d')
-    ctx.fillStyle = '#0a0a12'
-    ctx.fillRect(0, 0, width, height)
-
-    const kp = getKeypoints()
-    if (!kp) {
-      ctx.fillStyle = '#555'
-      ctx.font = '16px Arial'
-      ctx.textAlign = 'center'
-      ctx.fillText('Waiting for pose...', width / 2, height / 2)
-      return
-    }
-
-    // Transform and smooth
-    const transformed = transformCoords(kp)
-    const smoothed = smoothKeypoints(transformed, 0.4)
+    if (!ctx) return
     
-    const scale = zoom / 100
-    const panX = pan.x
-    const panY = pan.y
-    
-    // Project points
-    const projected = {}
-    for (const [name, pt] of Object.entries(smoothed)) {
-      if (!pt || pt.confidence < 0.2) continue
-      projected[name] = project3D(pt.x, pt.y, pt.z, rotation.x, rotation.y, scale, panX, panY)
-      projected[name].z = pt.z
-    }
-
-    // Get eye positions for head oval
-    // In screen coords: left_eye is on RIGHT, right_eye is on LEFT
-    const screenLeftEye = projected.left_eye    // Person's left = screen right
-    const screenRightEye = projected.right_eye  // Person's right = screen left
-    
-    if (screenLeftEye && screenRightEye) {
-      const cx = (screenLeftEye.x + screenRightEye.x) / 2
-      const cy = (screenLeftEye.y + screenRightEye.y) / 2
-      const eyeDist = Math.abs(screenRightEye.x - screenLeftEye.x)
-      
-      drawHeadOval(ctx, cx, cy, eyeDist * 1.3, eyeDist * 1.6)
-    }
-
-    // Define what to draw with colors
-    // Screen LEFT = person's RIGHT = right_eye
-    // Screen RIGHT = person's LEFT = left_eye
-    const landmarks = [
-      { name: 'nose', color: '#ff4757', label: 'NOSE' },
-      { name: 'right_eye', color: '#2ed573', label: 'R'},  // Screen left = person right
-      { name: 'left_eye', color: '#ffa502', label: 'L'},   // Screen right = person left
-      { name: 'right_ear', color: '#2ed573', label: '' },  // Person's right ear
-      { name: 'left_ear', color: '#ffa502', label: '' },    // Person's left ear
-      { name: 'mouth_left', color: '#a55eea', label: '' },
-      { name: 'mouth_right', color: '#a55eea', label: '' },
-    ]
-    
-    landmarks.forEach(({ name, color, label }) => {
-      const pt = projected[name]
-      if (!pt) return
-      
-      // Draw point
-      ctx.beginPath()
-      ctx.arc(pt.x, pt.y, 8, 0, 2 * Math.PI)
-      ctx.fillStyle = color
-      ctx.fill()
-      
-      // Glow
-      ctx.beginPath()
-      ctx.arc(pt.x, pt.y, 16, 0, 2 * Math.PI)
-      const glow = ctx.createRadialGradient(pt.x, pt.y, 0, pt.x, pt.y, 16)
-      glow.addColorStop(0, color.replace(')', ', 0.5)').replace('#', 'rgba(').replace(/([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})/i, (m, r, g, b) => `${parseInt(r,16)}, ${parseInt(g,16)}, ${parseInt(b,16)}`))
-      glow.addColorStop(1, 'transparent')
-      ctx.fillStyle = glow
-      ctx.fill()
-      
-      // Label
-      if (label) {
-        ctx.fillStyle = '#fff'
-        ctx.font = 'bold 14px Arial'
-        ctx.textAlign = 'center'
-        ctx.fillText(label, pt.x, pt.y - 15)
-      }
-    })
-
-    // Draw axes
-    const origin = project3D(0, 0, 0, rotation.x, rotation.y, scale * 0.18, panX, panY)
-    const xEnd = project3D(0.12, 0, 0, rotation.x, rotation.y, scale * 0.18, panX, panY)
-    const yEnd = project3D(0, 0.12, 0, rotation.x, rotation.y, scale * 0.18, panX, panY)
-    const zEnd = project3D(0, 0, 0.12, rotation.x, rotation.y, scale * 0.18, panX, panY)
-    
-    ctx.lineWidth = 3
-    
-    // X (nose toward viewer) - red
-    ctx.strokeStyle = 'rgba(255, 71, 87, 0.9)'
-    ctx.beginPath()
-    ctx.moveTo(origin.x, origin.y)
-    ctx.lineTo(xEnd.x, xEnd.y)
-    ctx.stroke()
-    
-    // Y (person's right) - green
-    ctx.strokeStyle = 'rgba(46, 213, 115, 0.9)'
-    ctx.beginPath()
-    ctx.moveTo(origin.x, origin.y)
-    ctx.lineTo(yEnd.x, yEnd.y)
-    ctx.stroke()
-    
-    // Z (up) - blue
-    ctx.strokeStyle = 'rgba(30, 144, 255, 0.9)'
-    ctx.beginPath()
-    ctx.moveTo(origin.x, origin.y)
-    ctx.lineTo(zEnd.x, zEnd.y)
-    ctx.stroke()
-    
-    // Labels
-    ctx.font = 'bold 12px Arial'
-    ctx.fillStyle = 'rgba(255, 71, 87, 0.9)'
-    ctx.fillText('X: nose', xEnd.x + 5, xEnd.y)
-    ctx.fillStyle = 'rgba(46, 213, 115, 0.9)'
-    ctx.fillText('Y: right', yEnd.x + 5, yEnd.y)
-    ctx.fillStyle = 'rgba(30, 144, 255, 0.9)'
-    ctx.fillText('Z: up', zEnd.x + 5, zEnd.y - 5)
-    
-    // Legend
-    ctx.font = '11px Arial'
-    ctx.fillStyle = 'rgba(46, 213, 115, 0.9)'
-    ctx.fillText('R = right eye (screen LEFT)', 60, height - 40)
-    ctx.fillStyle = 'rgba(255, 165, 2, 0.9)'
-    ctx.fillText('L = left eye (screen RIGHT)', 60, height - 22)
-
-  }, [poseData, rotation, pan, zoom])
-
-  useEffect(() => {
     let animId
     
-    const animate = () => {
-      if (autoRotate && !isDragging && !isPanning) {
-        autoRotateRef.current += 0.004
-        setRotation(prev => ({ ...prev, y: autoRotateRef.current }))
+    const render = function() {
+      // Clear
+      ctx.fillStyle = '#0a0a15'
+      ctx.fillRect(0, 0, width, height)
+      
+      // Get keypoints
+      let kp = null
+      if (poseData && typeof poseData === 'object') {
+        kp = poseData.keypoints || poseData.keypoints_3d
       }
-      animId = requestAnimationFrame(animate)
+      
+      if (!kp || typeof kp !== 'object') {
+        ctx.fillStyle = '#666'
+        ctx.font = '18px Arial'
+        ctx.textAlign = 'center'
+        ctx.fillText('Waiting for pose...', width/2, height/2)
+        animId = requestAnimationFrame(render)
+        return
+      }
+      
+      const rotX = view.current.rotX
+      const rotY = view.current.rotY
+      const zoom = view.current.zoom
+      
+      // Get landmark position
+      const getPos = function(idx) {
+        const name = LANDMARKS[idx]
+        if (!name || !kp[name]) return null
+        return {
+          x: kp[name].x || 0,
+          y: kp[name].y || 0,
+          z: kp[name].z || 0
+        }
+      }
+      
+      // 3D project
+      const project = function(x, y, z) {
+        // Center around hips
+        const leftHip = getPos(23)
+        const rightHip = getPos(24)
+        
+        let cx = 0.5, cy = 0.5
+        if (leftHip && rightHip) {
+          cx = (leftHip.x + rightHip.x) / 2
+          cy = (leftHip.y + rightHip.y) / 2
+        } else if (leftHip) {
+          cx = leftHip.x
+          cy = leftHip.y
+        } else if (rightHip) {
+          cx = rightHip.x
+          cy = rightHip.y
+        }
+        
+        // Normalize and center
+        const px = (x - cx) * 2
+        const py = (y - cy) * 2
+        const pz = (z || 0) * 2
+        
+        // Rotate
+        let x1 = px * Math.cos(rotY) - pz * Math.sin(rotY)
+        let z1 = px * Math.sin(rotY) + pz * Math.cos(rotY)
+        let y2 = py * Math.cos(rotX) - z1 * Math.sin(rotX)
+        
+        // Project to screen (flip Y for correct orientation)
+        const scale = zoom * Math.min(width, height) * 0.7
+        return {
+          x: width/2 + x1 * scale,
+          y: height/2 + y2 * scale,
+          z: z1
+        }
+      }
+      
+      // Draw bones
+      ctx.lineWidth = 4
+      ctx.lineCap = 'round'
+      
+      BONES.forEach(function(pair) {
+        const i = pair[0]
+        const j = pair[1]
+        const p1 = getPos(i)
+        const p2 = getPos(j)
+        
+        if (p1 && p2) {
+          const pt1 = project(p1.x, p1.y, p1.z)
+          const pt2 = project(p2.x, p2.y, p2.z)
+          
+          // Color by left/right side
+          const left = isLeftSide(i)
+          ctx.strokeStyle = left ? 'rgba(74, 158, 255, 0.9)' : 'rgba(255, 107, 107, 0.9)'
+          
+          ctx.beginPath()
+          ctx.moveTo(pt1.x, pt1.y)
+          ctx.lineTo(pt2.x, pt2.y)
+          ctx.stroke()
+        }
+      })
+      
+      // Draw joints
+      LANDMARKS.forEach(function(name, idx) {
+        const p = getPos(idx)
+        if (!p) return
+        
+        const pt = project(p.x, p.y, p.z)
+        
+        const left = isLeftSide(idx)
+        
+        // Size based on z (depth)
+        const size = 4 + (pt.z || 0) * 1.5
+        
+        ctx.beginPath()
+        ctx.arc(pt.x, pt.y, Math.max(3, Math.min(8, size)), 0, Math.PI * 2)
+        ctx.fillStyle = left ? '#4a9eff' : '#ff6b6b'
+        ctx.fill()
+        ctx.strokeStyle = '#fff'
+        ctx.lineWidth = 1
+        ctx.stroke()
+      })
+      
+      // Legend
+      ctx.font = 'bold 12px Arial'
+      ctx.textAlign = 'left'
+      ctx.fillStyle = '#4a9eff'
+      ctx.fillText('LEFT', 10, height - 35)
+      ctx.fillStyle = '#ff6b6b'
+      ctx.fillText('RIGHT', 55, height - 35)
+      ctx.font = '11px Arial'
+      ctx.fillStyle = '#888'
+      ctx.fillText('(screen perspective)', 10, height - 18)
+      
+      animId = requestAnimationFrame(render)
     }
     
-    animate()
-    return () => cancelAnimationFrame(animId)
-  }, [autoRotate, isDragging, isPanning])
-
-  const handleMouseDown = (e) => {
-    if (e.shiftKey) setIsPanning(true)
-    else setIsDragging(true)
-    setAutoRotate(false)
-    setLastPos({ x: e.clientX, y: e.clientY })
-  }
-
-  const handleMouseMove = (e) => {
-    if (!isDragging && !isPanning) return
+    render()
     
-    const dx = e.clientX - lastPos.x
-    const dy = e.clientY - lastPos.y
-    
-    if (isDragging) {
-      setRotation(prev => ({
-        x: Math.max(-1.5, Math.min(1.5, prev.x + dy * 0.008)),
-        y: prev.y + dx * 0.008
-      }))
-    } else {
-      setPan(prev => ({ x: prev.x + dx, y: prev.y + dy }))
-    }
-    
-    setLastPos({ x: e.clientX, y: e.clientY })
-  }
-
-  const handleMouseUp = () => {
-    setIsDragging(false)
-    setIsPanning(false)
-  }
-
-  const handleWheel = (e) => {
-    e.preventDefault()
-    const delta = e.deltaY > 0 ? -25 : 25
-    setZoom(prev => Math.max(80, Math.min(600, prev + delta)))
-  }
-
-  const reset = () => {
-    setRotation({ x: 0, y: 0 })
-    setPan({ x: 0, y: 0 })
-    setZoom(280)
-  }
-
-  const kp = getKeypoints()
+    return function() { cancelAnimationFrame(animId) }
+  }, [poseData, width, height])
 
   return (
-    <div className="relative bg-gray-900 rounded-lg overflow-hidden border border-blue-500">
-      <div className="flex justify-between items-center px-3 py-2 bg-gray-800 border-b border-gray-700">
-        <h3 className="text-sm font-semibold text-blue-400">3D Head Viewer</h3>
-        <div className="flex items-center gap-2">
-          <button
-            onClick={() => setAutoRotate(!autoRotate)}
-            className={`text-xs px-2 py-0.5 rounded ${autoRotate ? 'bg-green-800 text-green-300' : 'bg-gray-700 text-gray-400'}`}
-          >
-            Auto
-          </button>
-          <button onClick={reset} className="text-xs px-2 py-1 bg-gray-700 hover:bg-gray-600 rounded text-gray-300">
-            Reset
-          </button>
-        </div>
+    <div style={{ backgroundColor: '#000', border: '2px solid #4a9eff', borderRadius: 8, overflow: 'hidden' }}>
+      <div style={{ backgroundColor: '#16213e', padding: '8px 12px', borderBottom: '1px solid #333', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <span style={{ color: '#4a9eff', fontWeight: 'bold', fontSize: '14px' }}>
+          3D Skeleton
+        </span>
+        <button onClick={reset} style={{ background: '#333', color: '#fff', border: 'none', padding: '4px 8px', borderRadius: 4, fontSize: 11 }}>
+          Reset
+        </button>
       </div>
-      
-      <div className="relative">
-        <canvas
-          ref={canvasRef}
-          width={width}
-          height={height}
-          className="w-full h-auto cursor-move"
-          style={{ aspectRatio: `${width}/${height}` }}
-          onMouseDown={handleMouseDown}
-          onMouseMove={handleMouseMove}
-          onMouseUp={handleMouseUp}
-          onMouseLeave={handleMouseUp}
-          onWheel={handleWheel}
-        />
-        
-        <div className="absolute bottom-2 left-2 bg-black bg-opacity-70 text-xs font-mono p-2 rounded text-gray-400">
-          <div>Drag to rotate</div>
-          <div>Shift+Drag to pan</div>
-          <div>Scroll to zoom</div>
-        </div>
-
-        <div className="absolute top-2 right-2 flex flex-col gap-1">
-          <button onClick={() => setZoom(prev => Math.min(600, prev + 40))} className="bg-black bg-opacity-70 text-white text-xs px-2 py-1 rounded">+</button>
-          <div className="bg-black bg-opacity-70 text-xs font-mono px-2 py-1 rounded text-gray-400 text-center">{zoom}%</div>
-          <button onClick={() => setZoom(prev => Math.max(80, prev - 40))} className="bg-black bg-opacity-70 text-white text-xs px-2 py-1 rounded">-</button>
-        </div>
-
-        <div className="absolute top-2 left-2">
-          <span className={`text-xs px-2 py-0.5 rounded ${kp ? 'bg-green-900 text-green-400' : 'bg-gray-700 text-gray-500'}`}>
-            {kp ? 'Active' : 'No Data'}
-          </span>
-        </div>
+      <canvas
+        ref={canvasRef}
+        width={width}
+        height={height}
+        style={{ display: 'block', width: '100%', cursor: 'grab' }}
+        onMouseDown={handleMouseDown}
+        onMouseMove={handleMouseMove}
+        onMouseUp={handleMouseUp}
+        onMouseLeave={handleMouseUp}
+        onWheel={handleWheel}
+      />
+      <div style={{ padding: '8px', fontSize: 11, color: '#666', textAlign: 'center' }}>
+        Drag to rotate | Scroll to zoom
       </div>
     </div>
   )
